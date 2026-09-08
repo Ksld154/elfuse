@@ -86,6 +86,15 @@ OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 DISPATCH_MANIFEST := src/syscall/dispatch.tbl
 DISPATCH_GENERATOR := scripts/gen-syscall-dispatch.py
 DISPATCH_HEADER := $(BUILD_DIR)/dispatch.h
+
+# The usbdevfs departed-device vectors. Generated for the same reason
+# dispatch.h is: the table is data, the join against usbdev_ioctl's dispatch is
+# a gate, and neither is something to hand-edit. Under build/ so that the
+# formatting gates, which cover tests/*.h, have no opinion about a file a script
+# writes.
+DEPARTED_MANIFEST := tests/usbdev-ioctl-departed.tbl
+DEPARTED_GENERATOR := scripts/gen-usbdev-ioctl-departed.py
+DEPARTED_HEADER := $(BUILD_DIR)/usbdev-ioctl-departed-vectors.h
 HVF_LDFLAGS := -framework Hypervisor -framework IOKit -framework CoreFoundation -arch arm64
 
 # Generated headers under build/ that must exist before compiling sources that
@@ -126,6 +135,11 @@ $(DISPATCH_HEADER): $(DISPATCH_MANIFEST) $(DISPATCH_GENERATOR) src/syscall/abi.h
 	rm -f "$$tmp"
 
 $(BUILD_DIR)/syscall/syscall.o: $(DISPATCH_HEADER)
+
+$(DEPARTED_HEADER): $(DEPARTED_MANIFEST) $(DEPARTED_GENERATOR) \
+		src/syscall/usbdev.c | $(BUILD_DIR)
+	@echo "  GEN     $@"
+	$(Q)python3 $(DEPARTED_GENERATOR) --output $@
 
 ## Build the elfuse executable
 elfuse: $(ELFUSE_BIN)
@@ -286,6 +300,14 @@ $(BUILD_DIR)/test-dynamic-array-host: \
 # I/O), so the test links the code under test and nothing else.
 $(BUILD_DIR)/test-usb-desc-host: $(BUILD_DIR)/test-usb-desc-host.o \
 		$(BUILD_DIR)/runtime/usb-desc.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the usbdevfs URB bookkeeping host unit test (native macOS binary)
+# usbdev-urb.h is header-only arithmetic with no IOKit and no I/O, so the test
+# needs no object but its own.
+$(BUILD_DIR)/test-usbdev-urb-host: \
+		$(BUILD_DIR)/test-usbdev-urb-host.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
