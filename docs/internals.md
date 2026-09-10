@@ -1341,6 +1341,100 @@ saw a disconnect and the other half could be marked gone while attached. Across 
 are Mach-port-backed and cannot cross the `posix_spawn` that implements
 fork.
 
+### Testing The Engine Without Hardware
+
+IOKit publishes no loopback device, so the async engine had no in-tree lane at
+all: `ELFUSE_USB_FIXTURE`'s devices have no IOKit service behind them and stop
+at `SUBMITURB`'s argument gate. `ELFUSE_USB_FIXTURE=loopback` adds one that
+does, by substituting at the narrowest place that leaves every layer above it
+real: the two COM vtables. Every wire call in `usbdev.c` goes through
+`IOUSBDeviceInterface650 **` or `IOUSBInterfaceInterface800 **` as
+`(*h)->Method(h, ...)`, so `src/syscall/usbdev-fixture.c` hands back an object
+whose first member is a vtable of the same shape and nothing above it changes.
+The URB records, the per-endpoint FIFO, the completion callback, `urb_status`,
+the ZLP predicate, the readiness and disconnect maps, `REAPURB`, the drain and
+all of `poll.c` are the same code that runs against a board. Completions arrive
+from a one-shot `CFRunLoopTimer` on the event thread, which is where
+`IODispatchCalloutFromCFMessage` would have delivered them.
+
+What the fixture does is a script rather than a flag:
+`ELFUSE_USB_LOOPBACK=ep02:delay(80),ok;ep81:short(8)` and the rest of the
+vocabulary in `src/syscall/usbdev-fixture.c` name the `IOReturn` each outcome
+stands for, and a guest can rewrite the script, read back a log of what crossed
+the seam and terminate the device through vendor control requests. The log is
+what makes the `ZERO_PACKET` trailing packet observable rather than inferred.
+
+The seam is five `if (u->fake)` branches, one has-device probe and one bind
+call in `usbdev.c`, all behind a mode resolved once per process, and the flag
+is set only for the one location the fixture models -- so the other fixture modes, and every real
+device, take the paths they took before. `make test-usbdev-ioctl-loopback` is
+the standing check on that: the fd-contract lane must answer the same thing
+with the loopback device present as without it.
+
+A device that can be made to leave on demand is what the third loopback lane
+needs. `make test-usbdev-ioctl-departed` terminates the fixture's device once
+and then drives every usbdevfs ioctl the layer implements against it, asserting
+four things per request: the `ioctl(2)` return, the `errno` behind it, the poll
+revents left on the fd that asked, and the revents on another fd open on the
+same node, which is what says the disconnect was recorded against the device
+rather than against one caller. The surface is not a list anyone maintains:
+`scripts/gen-usbdev-ioctl-departed.py` reads it out of `usbdev_ioctl`'s own
+dispatch and refuses to emit the lane's vectors unless every request it
+dispatches has a row in `tests/usbdev-ioctl-departed.tbl` saying what Linux
+answers and why -- so an ioctl added to the layer fails `make check` until its
+departed-device answer is recorded. `make check-usbdev-departed` is that gate on
+its own.
+
+The default arm is in the join too, and had to be added to it: a join built
+from case labels alone covers every arm except the one catching what no label
+matches, which is how that arm's `ENOTTY` on a departed device survived the
+table built to find exactly that kind of answer. A row may name a `USBDEVFS_`
+request `usbdev.c` defines and dispatches nowhere, the generator refuses to
+emit while the arm exists with no row driving it, and three rows do.
+
+A row whose elfuse answer differs from Linux's carries both values and is an
+XFAIL: the lane fails if the difference widens and fails if it quietly closes,
+so a deliberate gap stays a recorded measurement instead of becoming a sentence
+in a comment. The lane runs three times because one process can hold only one
+departed device: the first correct `ENODEV` stamps every fd open on the node,
+so the rows that need a claim taken before the device left cannot share a
+process with the rows that take it away.
+
+None of that is in the shipped binary. `src/syscall/usbdev-fixture.c` is a
+translation unit under `src/` that only an assertion has a use for, so the
+default build links `src/syscall/usbdev-fixture-stub.c` in its place: the same
+seven entry points, answering `false` and `-ENODEV`, 44 bytes of text against
+the model's 11 KB. `USB_LOOPBACK_FIXTURE=1` swaps the two, and it names the
+binary as well: `mk/config.mk` points `ELFUSE_BIN` at `$(ELFUSE_LOOPBACK_BIN)`
+for that flavor, so the fixture build writes `build/elfuse-loopback` and a
+plain `make` leaves `build/elfuse` without the model. The name is what carries
+that, because nothing else does. The switch changes `SRCS` and not `CFLAGS`,
+and the stale-object guard in `mk/common.mk` is keyed on `CFLAGS` alone, so
+while both flavors wrote one path a fixture build left the model in
+`build/elfuse` and the next `make elfuse` answered "Nothing to be done" --
+measured on the tree as it stood before this split, at 834288 bytes with `nm`
+finding `_usbdev_fixture_lock`, against 815984 clean, until a `make clean`.
+That sequence cannot be run again to re-measure, which is what the split is
+for, so those two figures stay dated to the pre-split tree and are the only
+place this series records them. What reproduces on the tree as it stands is the
+pair the paths now keep apart: a clean `build/elfuse` is 815984 bytes with the
+symbol 0 times, and `build/elfuse-loopback` is 834304 bytes with it once. Both
+are link outputs, so they hold only for the compiler that produced them:
+Homebrew `clang` 22.1.8, reached through `/opt/homebrew/opt/llvm/bin` on
+`PATH`, which is the same toolchain the format gate already requires. Built
+with Apple `clang` 17.0.0 from `/usr/bin` instead -- which is what `CC :=
+clang` in `mk/toolchain.mk` finds when that directory is not on `PATH` -- the
+same two commits give 817776 and 836160, deterministic: +1792 on the default
+flavor and +1856 on the loopback one, a gap per flavor rather than one
+constant. So a byte count that does not match here is a different compiler
+before it is a different tree, and the two symbol counts, 0 and 1, are what
+hold under either.
+`.ci/check-usb-fixture-bin.sh` fails if the two paths are ever equal again.
+Which object defines the seam is the whole difference between the two builds:
+not one branch in `usbdev.c` is conditionally compiled, so the fixture cannot
+drift into code the default build never compiles, and the default build still
+pays the branch that keeps the fixture off every path it must not touch.
+
 ### Deviations From Linux
 
 | usbfs behavior | elfuse behavior |

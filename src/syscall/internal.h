@@ -149,6 +149,7 @@
  *                                    sysroot_lock (proc-state.c)
  *                                    usb_lock (runtime/usb-sysfs.c)
  *                                    usbdev_loop_lock (usbdev.c)
+ *                                    usbdev_fixture_lock (usbdev-fixture.c)
  *   wake_lock (syscall/wakeup-pipe.c)
  *
  * log_mutex is the one leaf every other entry may hold: a lock anywhere in

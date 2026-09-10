@@ -517,8 +517,9 @@ The lanes these drive:
 | `test-dir-fd-budget-union` | a union directory fd costs one host descriptor, like a plain one |
 | `test-fstatfs-fd-identity` | `fstatfs` answers for the descriptor it pinned, not for the fd number |
 | `test-usbdev-faults` | an interface number wider than the table that indexes it, each open-time failure reported as itself, a close inside the fd publish window leaking nothing, and a reap that answers for the description it snapshotted rather than the fd number |
+| `test-usbdev-ioctl-departed` | every usbdevfs ioctl this layer names, on a device that has gone: the return, the `errno`, the stamp on the fd that asked and the stamp on a peer fd, against the Linux answer recorded for that request |
 
-Two lanes carry rows that are recorded rather than asserted, and print as
+Some lanes carry rows that are recorded rather than asserted, and print as
 `XFAIL`. An `XFAIL` row is a measured Linux value the build knowingly does not
 meet: it is neither a pass nor a failure, it does not turn the lane red, and the
 value elfuse gives today is carried beside it so that a departure from either
@@ -533,6 +534,16 @@ whose parent closes its copy of the fd before the backing has been drained
 answers with its primary alone, because the backing half belongs to a stream
 that has gone. Both rows are load-bearing in pairs -- neither number alone
 separates the answers the site could give -- so both are printed.
+
+`test-usbdev-ioctl-departed` is the same idea with the recording moved out of
+the lane and into data. Its rows are generated from
+`tests/usbdev-ioctl-departed.tbl`, one per usbdevfs ioctl, and a row that
+diverges from Linux carries both tuples: the lane fails if the elfuse answer
+stops matching the recorded one, and fails just as loudly if it starts matching
+Linux's, because an XFAIL nobody notices closing is a row that should have been
+retired. The generator refuses to emit at all unless every ioctl
+`usbdev_ioctl` dispatches has a row, so the recording cannot fall behind the
+surface it describes.
 
 USB-layer coverage is split by what it needs. `test-uevent-socket` needs no
 hardware and runs in the matrix like any other unit test. The two usbdevfs
@@ -552,12 +563,106 @@ split from the other side. That header exists because the fixture stops at the
 argument gate: the async engine's first review found five defects in code no
 lane executed, and the arithmetic half of it is testable on any machine.
 
-Everything past that gate needs a device that can complete a transfer, and
-there is none in the tree, so it stays on the board and out of tree. A
-hardware-dependent check that does move in must be gated on an environment
-variable naming the device and must skip with a stated reason when it is
-absent -- a skip is not a pass, and the skip lists above are the model:
-deliberate, explained, and checked.
+`test-usbdev-urb-loopback` covers the other half. IOKit publishes no loopback
+device, so the fixture becomes one: `ELFUSE_USB_FIXTURE=loopback` substitutes
+for the two IOKit COM vtables and for nothing above them (see
+[internals.md](internals.md#testing-the-engine-without-hardware)), which puts
+submit, the per-endpoint queue, the completion callback on the event thread,
+`DISCARDURB`, `REAPURB` blocking and non-blocking, poll and epoll readiness,
+the `CAP_REAP_AFTER_DISCONNECT` drain and the `ZERO_PACKET` trailing packet
+under assertion on any machine. The `wedge` script step adds the transfer
+whose abort outlives the engine's 2 s drain deadline, which is what puts the
+orphaning path and the two ioctls that refuse on it under assertion too;
+nothing else in the vocabulary reaches them, because every other outstanding
+transfer answers an abort at once. It is also what times the drain, from both
+ends: the lane asserts that a `REAPURBNDELAY` which owes the post-disconnect
+kill issues its aborts and answers without waiting for them, and that a loop of
+them still reaches `ENODEV` a drain deadline later rather than spinning on
+`EAGAIN` for as long as the wire withholds the abort. The elapsed time is the
+whole measurement in both. A `terminate` with `wIndex` bit 1 tears the claimed
+interface's pipes down and changes nothing else, so `GetPipeProperties` alone
+answers `NoDevice`: that is the device vanishing between the `GetNumEndpoints`
+that sizes a pipe map and the calls that fill it in, and it is the only way in
+the vocabulary to reach a half-built map. Bit 2 is the same idea for the one
+answer only an abort can give: `AbortPipe` and `USBDeviceAbortPipeZero` return
+`NoDevice` and cancel nothing, which is what a `DISCARDURB` meets when the user
+client behind its handle has gone. It is its own fact rather than a consequence
+of `terminate`, because a disconnect drain issues aborts and IOKit lands those:
+tying the two would leave every `never` transfer outstanding for ever and no
+drain would ever finish.
+
+Two things the lane asserts are not guest-visible at all, so the fixture counts
+them and the guest reads the counts back through a control request. One so far:
+device handles the layer released while the fixture still owned a transfer on
+the default control pipe. On real IOKit that is a use-after-free and here it is
+not -- the fixture frees a COM wrapper nothing dereferences again -- so the
+count is what stands in for it, and it is read on a later fd because the
+release happens at close.
+
+One scenario runs in a process of its own (`test-usbdev-urb-loopback
+terminate-race`): it terminates the device while an fd is closing, and every
+other scenario still needs that device afterwards. What it asks is whether a
+terminate delivered inside a close's two-second drain can stamp a guest fd
+number that a sibling has already taken. Two fds on one node carry the other
+cross-fd assertion, that a disconnect one of them provokes reaches the one that
+never touched the device, and a budget filled with URBs that will not complete
+carries the third, that a synchronous `CONTROL` is charged against the same
+allowance a synchronous `BULK` is. `test-usbdev-ioctl-loopback` re-runs the
+fd-contract lane with that device present, which is the check that the seam did
+not reach a path it is not supposed to touch.
+
+`test-usbdev-ioctl-departed` uses the same device for the one thing no other
+lane can arrange: a device that leaves while fds are open on it. It terminates
+the fixture's device once and then drives every usbdevfs ioctl the layer
+implements, one fresh fd per request, asserting the return, the `errno`, the
+poll revents on the fd that asked and the revents on a second fd open on the
+same node. Three runs, because the first correct `ENODEV` stamps every fd on
+the node: the requests that need a claim taken before the device left get a
+process each. What the lane may assert is not written in it --
+`scripts/gen-usbdev-ioctl-departed.py` reads the ioctl surface out of
+`usbdev_ioctl`'s dispatch and joins it against
+`tests/usbdev-ioctl-departed.tbl`, so an ioctl added to the layer fails `make
+check` until somebody records what Linux answers for it on a departed device.
+`make check-usbdev-departed` runs that join by itself.
+
+The loopback lanes run `build/elfuse-loopback`, which they build by re-entering
+make with `USB_LOOPBACK_FIXTURE=1`. That variable is also what names the
+binary: `mk/config.mk` points `ELFUSE_BIN` at `$(ELFUSE_LOOPBACK_BIN)` for the
+fixture flavor, so the two flavors never write the same path and `build/elfuse`
+cannot be a stale copy of the fixture build. It could before, and the flavor
+stamp in `mk/common.mk` had nothing to say about it, being keyed on `CFLAGS`
+while the switch changes `SRCS`: `make clean; make elfuse; make
+USB_LOOPBACK_FIXTURE=1 elfuse; make elfuse` printed `Nothing to be done` and
+left `nm build/elfuse` finding `_usbdev_fixture_lock` until the next `make
+clean`. That was measured before the split and cannot be re-measured after it;
+the dated byte counts are in
+[internals.md](internals.md#testing-the-engine-without-hardware).
+`.ci/check-usb-fixture-bin.sh` asks make for both paths and fails if they are
+the same; `make check` runs it. The model is therefore not in `build/elfuse`,
+and so not in anything shipped: see
+[internals.md](internals.md#testing-the-engine-without-hardware).
+
+What the loopback cannot answer stays on the board, and the list is short and
+worth keeping honest: real timing, NAKs, maxpacket segmentation, DMA alignment
+and throughput; that IOKit really delivers completions on the runloop, and the
+`IODispatchCalloutFromCFMessage` opacity that motivates the URB record's atomic
+owner (a timer callout is fully visible to ThreadSanitizer, so that
+justification is board-only); exclusive-access arbitration and kernel-driver
+binding, so `GETDRIVER` and `DISCONNECT_CLAIM` against a real driver; a real
+`SET_CONFIGURATION`, `SET_INTERFACE` pipe renumbering and port `RESET`; that a
+device actually receives the zero-length packet, as opposed to elfuse emitting
+it under the right predicate; and a physical unplug mid-transfer. Two of the
+engine's own answers are board-only for the same reason, and breaking either
+of them leaves the lane green: the `ZERO_PACKET` write's dropped `async_lock`
+and its bounded timeout only matter against an endpoint that NAKs, and the
+fixture answers a zero-length write immediately and ignores both timeout
+arguments; and so is the bystander window `ep_aborting` shuts, because the
+fixture retargets an aborted transfer's timer under its own lock and can never
+start a follower into an abort that is still running. The guest probes for
+those live out of tree. A hardware-dependent check that does move
+in must be gated on an environment variable naming the device and must skip
+with a stated reason when it is absent -- a skip is not a pass, and the
+skip lists above are the model: deliberate, explained, and checked.
 
 ## Validation Strategy By Change Type
 

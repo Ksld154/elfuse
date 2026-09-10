@@ -80,8 +80,27 @@ SRCS := \
     debug/log.c \
     debug/syscall-hist.c
 
+# The USB fixture seam (src/syscall/usbdev-fixture.h). usbdev.c calls it with no
+# conditional compilation of its own, so exactly one translation unit has to
+# define the entry points and the choice is made here: the stub in every build,
+# the loopback device model when USB_LOOPBACK_FIXTURE asks for it. Listing both
+# would be a duplicate-symbol link error, which is the property that keeps a
+# default build from quietly acquiring the model.
+ifeq ($(USB_LOOPBACK_FIXTURE),1)
+SRCS += syscall/usbdev-fixture.c
+else
+SRCS += syscall/usbdev-fixture-stub.c
+endif
+
 SRCS := $(addprefix src/,$(SRCS))
 OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
+
+# Every host source, whether or not this build links it. Only one of the two
+# fixture-seam translation units is ever in SRCS, and a static analyzer wants
+# both: make lint reads this rather than SRCS so that turning the fixture off
+# does not also turn off the checking of it.
+ALL_SRCS := $(sort $(SRCS) src/syscall/usbdev-fixture.c \
+                   src/syscall/usbdev-fixture-stub.c)
 
 DISPATCH_MANIFEST := src/syscall/dispatch.tbl
 DISPATCH_GENERATOR := scripts/gen-syscall-dispatch.py
@@ -375,9 +394,24 @@ $(BUILD_DIR)/%: tests/%.c | $(BUILD_DIR)
 	@echo "  CROSS   $<"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $<
 
+# test-usbdev-ioctl-departed reads the generated vectors out of build/, so it
+# needs that directory on the include path where the other guest binaries do
+# not.
+$(BUILD_DIR)/test-usbdev-ioctl-departed: tests/test-usbdev-ioctl-departed.c \
+		$(DEPARTED_HEADER) | $(BUILD_DIR)
+	@echo "  CROSS   $<"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -I$(BUILD_DIR) -o $@ $<
+
 # test-usbdev-ioctl churns open/read/close on one usbdevfs node from four
 # threads, so a close and a sibling's open contend for the same fd number.
 $(BUILD_DIR)/test-usbdev-ioctl: tests/test-usbdev-ioctl.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-usbdev-urb-loopback opens a second usbdevfs node from a thread while the
+# first is closing, so the two contend for one guest fd number.
+$(BUILD_DIR)/test-usbdev-urb-loopback: \
+		tests/test-usbdev-urb-loopback.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 

@@ -947,7 +947,8 @@ static void check_answers_without_a_device(void)
      * so the discard's own scan is not what decides. The scan reads the pending
      * list, which is this layer's bookkeeping and says nothing about the
      * device, so it used to answer -EINVAL here and reach libusb as
-     * LIBUSB_ERROR_NOT_FOUND on an unplug.
+     * LIBUSB_ERROR_NOT_FOUND on an unplug. The -EINVAL half is asserted where a
+     * device exists, in tests/test-usbdev-ioctl-departed.c's setup.
      */
     TEST("DISCARDURB of an unknown URB asks the device first");
     EXPECT_EQ(io(fd, USBDEVFS_DISCARDURB, NULL), -ENODEV, "discardurb");

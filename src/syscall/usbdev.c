@@ -149,6 +149,7 @@
 #include "syscall/io.h"
 #include "syscall/linux-wire.h"
 #include "syscall/proc.h"
+#include "syscall/usbdev-fixture.h"
 #include "syscall/usbdev-urb.h"
 #include "syscall/usbdev.h"
 #include "utils.h"
@@ -554,7 +555,16 @@ typedef struct usbdev {
     size_t blob_len;
     off_t pos;   /* read()/lseek() file position */
     int pipe_wr; /* write end of the readiness pipe (holds one token) */
-    io_service_t service;          /* retained IOUSBDevice service */
+    io_service_t service; /* retained IOUSBDevice service */
+
+    /* ELFUSE_USB_FIXTURE=loopback stands this device up behind the IOKit COM
+     * seam instead of a wire. Resolved once, at the first call that needs the
+     * device, and then read as a plain field: no path re-reads the environment.
+     * service stays IO_OBJECT_NULL for such a device rather than holding a
+     * synthetic port, so every IOObjectRelease and the NULL-service guard in
+     * usbdev_arm_disconnect_watch stay correct without a special case.
+     */
+    bool fake;
     IOUSBDeviceInterface650 **dev; /* lazily created device plugin */
     bool dev_open;                 /* USBDeviceOpen succeeded */
     bool dev_open_tried;
@@ -981,9 +991,18 @@ static io_service_t usbdev_service_for_location(uint32_t location_id)
  */
 static int64_t usbdev_ensure_service(usbdev_t *u)
 {
-    if (u->service != IO_OBJECT_NULL)
+    if (u->fake || u->service != IO_OBJECT_NULL)
         return 0;
 
+    /* Fixture seam (syscall/usbdev-fixture.h), and the only place the flag is
+     * set. It answers for one modeled location and identity, so every other
+     * device -- including the other ELFUSE_USB_FIXTURE models, whose nodes have
+     * no service at all -- takes the registry path below unchanged.
+     */
+    if (usbdev_fixture_has_device(u->location_id, u->vid, u->pid)) {
+        u->fake = true;
+        return 0;
+    }
     io_service_t svc = usbdev_service_for_location(u->location_id);
     if (svc == IO_OBJECT_NULL)
         return -LINUX_ENODEV;
@@ -1025,6 +1044,15 @@ static int64_t usbdev_ensure_dev_plugin(usbdev_t *u)
     int64_t srv = usbdev_ensure_service(u);
     if (srv < 0)
         return srv;
+    if (u->fake) {
+        IOUSBDeviceInterface650 **dev = NULL;
+        int64_t frc =
+            usbdev_fixture_open_device(u->location_id, u->vid, u->pid, &dev);
+        if (frc < 0)
+            return frc;
+        usbdev_publish_dev_locked(u, dev);
+        return 0;
+    }
     IOCFPlugInInterface **plug = NULL;
     SInt32 score = 0;
     IOReturn r = IOCreatePlugInInterfaceForService(
@@ -1136,12 +1164,12 @@ static io_service_t usbdev_iface_service(usbdev_t *u,
  * interface, not an interface number out of range, not a RESET that touches no
  * pipe -- until the device has been asked in that call. Linux gets it from
  * usbdev_do_ioctl's connected() gate, which reads device state ahead of
- * proc_getdriver, proc_disconnect_claim, proc_ioctl and proc_resetdevice, so
- * the argument checks inside those live behind it; here neither of the two
- * things they read is device state. u->dev is a cached handle
- * usbdev_ensure_dev_plugin hands back without a call, and a claim is this
- * layer's own bookkeeping, which stays true after the device leaves. Only a
- * question to IOKit can come back with a device-gone code, which is what
+ * proc_getdriver, proc_disconnect_claim, proc_ioctl, proc_resetdevice and
+ * proc_claiminterface, so the argument checks inside those live behind it; here
+ * neither of the two things they read is device state. u->dev is a cached
+ * handle usbdev_ensure_dev_plugin hands back without a call, and a claim is
+ * this layer's own bookkeeping, which stays true after the device leaves. Only
+ * a question to IOKit can come back with a device-gone code, which is what
  * usbdev_ioret_op turns into the -ENODEV and the disconnect stamp the rest of
  * the fd then answers from.
  */
@@ -1289,6 +1317,7 @@ static void *usbdev_loop_main(void *arg)
         CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &ctx);
     if (keep)
         CFRunLoopAddSource(CFRunLoopGetCurrent(), keep, kCFRunLoopDefaultMode);
+    usbdev_fixture_bind_loop(CFRunLoopGetCurrent());
     pthread_mutex_lock(&usbdev_loop_lock);
     usbdev_loop = CFRunLoopGetCurrent();
     pthread_cond_broadcast(&usbdev_loop_cv);
@@ -1579,6 +1608,14 @@ static void usbdev_arm_disconnect_watch(usbdev_t *u)
 {
     if (u->notif != IO_OBJECT_NULL)
         return;
+    if (u->fake) {
+        /* Same callback, same packed token: what changes is who posts the
+         * terminate message.
+         */
+        usbdev_fixture_watch(u->location_id, usbdev_interest_cb,
+                             usbdev_watch_token(u));
+        return;
+    }
     if (u->service == IO_OBJECT_NULL)
         return;
     IONotificationPortRef port = usbdev_notify_get();
@@ -2279,14 +2316,39 @@ static int64_t usbdev_claim_locked(usbdev_t *u, unsigned ifnum)
     if (fi->claimed)
         return 0; /* already ours */
 
-    /* Ahead of the interface lookup so a device that is not there answers
-     * -ENODEV rather than "no such interface".
+    /* Invariant: a claim this call creates is created against a device the call
+     * has just reached. The two answers above create none -- the number bound
+     * and the already-ours short-circuit -- and neither asks; what stands
+     * behind each of them is the row of that name in
+     * tests/usbdev-ioctl-departed.tbl.
+     *
+     * Ahead of the branch below rather than inside either arm, because only one
+     * arm asks the device on its own: the registry arm's usbdev_iface_service
+     * runs the enumeration, and the fixture arm collapses the whole lookup into
+     * one seam call. usbdev_ensure_dev_plugin stood here and asked nothing --
+     * it hands back a cached handle -- so once that arm existed a device that
+     * had gone granted the claim, and every op that claims implicitly through
+     * usbdev_pipe_for_ep answered from it: measured on a departed loopback
+     * device, CLAIMINTERFACE, CLEAR_HALT, RESETEP and SETINTERFACE all returned
+     * 0 with the fd left unstamped, where Linux's connected() gate makes all
+     * four -ENODEV.
      */
-    int64_t drc = usbdev_ensure_dev_plugin(u);
+    int64_t drc = usbdev_ensure_dev_reachable(u);
     if (drc < 0)
         return drc;
 
     IOUSBInterfaceInterface800 **intf = NULL;
+    if (u->fake) {
+        /* One branch for the service lookup, the plugin and USBInterfaceOpen at
+         * once: all three are IOKit calls with no separately interesting
+         * answer, and what the lane is about starts after the claim.
+         */
+        int64_t frc = usbdev_fixture_open_iface(u->location_id, ifnum, &intf);
+        if (frc < 0)
+            return frc;
+        goto claimed;
+    }
+
     int64_t serr;
     io_service_t ifs = usbdev_iface_service(u, ifnum, &serr);
     if (ifs == IO_OBJECT_NULL)
@@ -2325,6 +2387,7 @@ static int64_t usbdev_claim_locked(usbdev_t *u, unsigned ifnum)
         return e == 0 ? -LINUX_EBUSY : e;
     }
 
+claimed:
     /* Publish under async_lock: the late-callback orphan scan reads intf and
      * orphans with only that lock held. A stale orphan count belongs to a
      * previous (leaked) handle of this slot, so it starts over at zero.
@@ -2706,6 +2769,8 @@ static void usbdev_teardown_locked(usbdev_t *u)
         drained = false;
     pthread_mutex_unlock(&u->async_lock);
     usbdev_free_completed(u);
+    if (u->fake)
+        usbdev_fixture_unwatch(usbdev_watch_token(u));
     if (u->notif != IO_OBJECT_NULL) {
         IOObjectRelease(u->notif);
         u->notif = IO_OBJECT_NULL;
@@ -2737,6 +2802,7 @@ static void usbdev_teardown_locked(usbdev_t *u)
         IOObjectRelease(u->service);
         u->service = IO_OBJECT_NULL;
     }
+    u->fake = false;
 
     /* Orphaned callbacks skip the pipe write, so closing it here is safe even
      * on the timeout path; -1 under async_lock keeps the callback's check and
@@ -3127,6 +3193,7 @@ int64_t usbdev_open_path(const char *path, int linux_flags)
     u->pos = 0;
     u->pipe_wr = pipefd[1];
     u->service = IO_OBJECT_NULL;
+    u->fake = false;
     u->dev = NULL;
     u->dev_orphans = 0;
     u->dev_serial = 0;
@@ -4784,8 +4851,10 @@ int64_t usbdev_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
      * written down wrong twice. What each arm below answers on a device that
      * has gone, what Linux answers, and which differences are deliberate is
      * tests/usbdev-ioctl-departed.tbl: one row per request, joined against this
-     * dispatch by scripts/gen-usbdev-ioctl-departed.py, so an arm added here
-     * cannot escape the table.
+     * dispatch by scripts/gen-usbdev-ioctl-departed.py so an arm added here
+     * cannot escape the table, and driven by
+     * tests/test-usbdev-ioctl-departed.c, which fails both when a recorded gap
+     * widens and when one quietly closes. Running that lane prints the table.
      *
      * The default arm is in that join too, through the request codes defined at
      * the top of this file and dispatched nowhere, because a sentence asserting
