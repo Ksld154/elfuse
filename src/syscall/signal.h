@@ -447,6 +447,14 @@ void signal_refresh_pending_hint(void);
 int signal_pending(void);
 bool signal_pending_interruption(bool *restart_out);
 
+/* True when a signal that reaches the guest is pending for the calling thread,
+ * with a process-directed one moved into this thread's private set first. A
+ * wait that several threads leave on one broadcast uses this instead of
+ * signal_pending(): the shared set is visible to every thread, and Linux
+ * complete_signal() interrupts only the one thread it picks.
+ */
+bool signal_claim_interruption(void);
+
 /* True if anything that would normally be drained by signal_check_timer is
  * currently live: an unblocked pending signal, OR any of the three guest
  * itimers is armed. The shim's identity fast path consults this (indirectly via

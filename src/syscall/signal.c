@@ -1646,6 +1646,23 @@ static int signal_claim_waking_locked(uint64_t blocked)
     return signum;
 }
 
+bool signal_claim_interruption(void)
+{
+    /* Same lock-free fast path as signal_pending(). */
+    uint64_t hint =
+        atomic_load_explicit(&sig_pending_hint, memory_order_acquire);
+    uint64_t blocked =
+        atomic_load_explicit(thread_blocked_ptr(), memory_order_acquire);
+    if ((hint & ~blocked) == 0)
+        return false;
+
+    pthread_mutex_lock(&sig_lock);
+    blocked = atomic_load_explicit(thread_blocked_ptr(), memory_order_acquire);
+    bool claimed = signal_claim_waking_locked(blocked) != 0;
+    pthread_mutex_unlock(&sig_lock);
+    return claimed;
+}
+
 /* rt_sigsuspend. */
 
 int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva, uint64_t sigsetsize)
