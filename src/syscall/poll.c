@@ -383,9 +383,12 @@ ppoll_retry:
                 goto ppoll_retry;
         }
 
-        /* Check for process/thread interrupts after waking. */
+        /* Check for process/thread interrupts after waking. The signal is
+         * claimed, not just seen: every thread in poll() returns on the same
+         * wakeup byte, and only one of them may report EINTR for it.
+         */
         if (thread_stop_requested() || futex_interrupt_consume() ||
-            signal_pending_interruption(NULL)) {
+            signal_claim_interruption_masked(saved_mask)) {
             /* Finite wait: part of the guest's timeout is already spent. */
             if (deadline_ms >= 0)
                 syscall_restart_forbid();
@@ -880,7 +883,7 @@ pselect_retry:
         }
 
         if (thread_stop_requested() || futex_interrupt_consume() ||
-            signal_pending_interruption(NULL)) {
+            signal_claim_interruption_masked(saved_blocked)) {
             /* Finite wait: part of the guest's timeout is already spent. */
             if (has_timeout)
                 syscall_restart_forbid();
@@ -2028,8 +2031,8 @@ int64_t sys_epoll_pwait(guest_t *g,
         bool interrupted = thread_stop_requested() &&
                            !(nready > 0 && thread_stop_is_leader_work_only());
         if (!interrupted && nready <= 0)
-            interrupted =
-                futex_interrupt_consume() || signal_pending_interruption(NULL);
+            interrupted = futex_interrupt_consume() ||
+                          signal_claim_interruption_masked(saved_mask);
         if (interrupted) {
             /* Finite wait: part of the guest's timeout is already spent. */
             if (has_timeout)

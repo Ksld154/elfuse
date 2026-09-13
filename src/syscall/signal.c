@@ -1648,6 +1648,11 @@ static int signal_claim_waking_locked(uint64_t blocked)
 
 bool signal_claim_interruption(void)
 {
+    return signal_claim_interruption_masked(0);
+}
+
+bool signal_claim_interruption_masked(uint64_t saved_blocked)
+{
     /* Same lock-free fast path as signal_pending(). */
     uint64_t hint =
         atomic_load_explicit(&sig_pending_hint, memory_order_acquire);
@@ -1658,9 +1663,16 @@ bool signal_claim_interruption(void)
 
     pthread_mutex_lock(&sig_lock);
     blocked = atomic_load_explicit(thread_blocked_ptr(), memory_order_acquire);
-    bool claimed = signal_claim_waking_locked(blocked) != 0;
+
+    /* Claim only what this thread can deliver once @saved_blocked is back. A
+     * signal only the temporary mask unblocks still ends the wait, but it stays
+     * shared: signal_deliver() tests the restored mask, and binding it here
+     * would take it away from a sibling that could run the handler.
+     */
+    bool woke = signal_claim_waking_locked(blocked | saved_blocked) != 0 ||
+                signal_set_would_wake_locked(self_pending_locked() & ~blocked);
     pthread_mutex_unlock(&sig_lock);
-    return claimed;
+    return woke;
 }
 
 /* rt_sigsuspend. */

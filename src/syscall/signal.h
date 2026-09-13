@@ -455,6 +455,13 @@ bool signal_pending_interruption(bool *restart_out);
  */
 bool signal_claim_interruption(void);
 
+/* signal_claim_interruption() for a wait that runs under a temporary mask and
+ * puts @saved_blocked back before the syscall epilogue delivers (ppoll,
+ * pselect6, epoll_pwait). A signal that only the temporary mask unblocks is
+ * reported without being claimed. Pass 0 when no mask was installed.
+ */
+bool signal_claim_interruption_masked(uint64_t saved_blocked);
+
 /* True if anything that would normally be drained by signal_check_timer is
  * currently live: an unblocked pending signal, OR any of the three guest
  * itimers is armed. The shim's identity fast path consults this (indirectly via
