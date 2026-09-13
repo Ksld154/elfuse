@@ -1624,6 +1624,45 @@ static void signal_claim_shared_locked(signal_pending_t *tp, int signum)
     refresh_pending_hint_locked();
 }
 
+/* The first signal under @blocked that would wake this thread, claimed from the
+ * shared set when it came from there. Private set first, matching
+ * signal_deliver()'s dequeue order: a thread-directed signal is already bound
+ * here. Without a thread to bind it to there is only one vCPU to race with, so
+ * the signal stays shared. Caller holds sig_lock.
+ */
+static int signal_claim_waking_locked(uint64_t blocked)
+{
+    signal_pending_t *tp = current_thread ? &current_thread->tpending : NULL;
+
+    int signum = signal_first_waking_locked(
+        tp ? pending_load(&tp->pending) & ~blocked : 0);
+    if (signum)
+        return signum;
+
+    signum = signal_first_waking_locked(
+        pending_load(&sig_state.shared.pending) & ~blocked);
+    if (signum && tp)
+        signal_claim_shared_locked(tp, signum);
+    return signum;
+}
+
+bool signal_claim_interruption(void)
+{
+    /* Same lock-free fast path as signal_pending(). */
+    uint64_t hint =
+        atomic_load_explicit(&sig_pending_hint, memory_order_acquire);
+    uint64_t blocked =
+        atomic_load_explicit(thread_blocked_ptr(), memory_order_acquire);
+    if ((hint & ~blocked) == 0)
+        return false;
+
+    pthread_mutex_lock(&sig_lock);
+    blocked = atomic_load_explicit(thread_blocked_ptr(), memory_order_acquire);
+    bool claimed = signal_claim_waking_locked(blocked) != 0;
+    pthread_mutex_unlock(&sig_lock);
+    return claimed;
+}
+
 /* rt_sigsuspend. */
 
 int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva, uint64_t sigsetsize)
@@ -1678,28 +1717,7 @@ int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva, uint64_t sigsetsize)
             pthread_mutex_lock(&sig_lock);
             uint64_t now_blocked = atomic_load_explicit(thread_blocked_ptr(),
                                                         memory_order_acquire);
-            signal_pending_t *tp =
-                current_thread ? &current_thread->tpending : NULL;
-
-            /* Private set first, matching signal_deliver()'s dequeue order: a
-             * thread-directed signal is already bound here and needs no claim.
-             */
-            int wake_sig = signal_first_waking_locked(
-                tp ? pending_load(&tp->pending) & ~now_blocked : 0);
-            if (!wake_sig) {
-                int shared_sig = signal_first_waking_locked(
-                    pending_load(&sig_state.shared.pending) & ~now_blocked);
-                if (shared_sig) {
-                    wake_sig = shared_sig;
-
-                    /* Without a thread to bind it to there is only one vCPU to
-                     * race with, so leave the signal shared.
-                     */
-                    if (tp)
-                        signal_claim_shared_locked(tp, shared_sig);
-                }
-            }
-            woke = wake_sig != 0;
+            woke = signal_claim_waking_locked(now_blocked) != 0;
             pthread_mutex_unlock(&sig_lock);
             if (woke)
                 break;
