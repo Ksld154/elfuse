@@ -6,14 +6,16 @@
  *
  * kill(2) queues one instance for the whole thread group, and Linux
  * complete_signal() wakes only the thread it picks to run the handler. The
- * elfuse waits behind read, ppoll, pselect6, epoll_pwait and flock all return
- * together on one wakeup byte or on a shared polling slice, so each has to take
- * the signal for itself before reporting EINTR: every sibling that merely sees
- * it pending returns EINTR with no handler to run.
+ * elfuse waits behind read, ppoll, pselect6, epoll_pwait, flock and futex all
+ * return together on one wakeup byte or on a shared polling slice, so each has
+ * to take the signal for itself before reporting EINTR: every sibling that
+ * merely sees it pending returns EINTR with no handler to run.
  */
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <linux/futex.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -24,6 +26,7 @@
 #include <sys/epoll.h>
 #include <sys/file.h>
 #include <sys/select.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -34,7 +37,16 @@ int passes = 0, fails = 0;
 #define WAITERS 4
 #define ROUNDS 4
 
-enum wait_kind { WAIT_READ, WAIT_PPOLL, WAIT_PSELECT, WAIT_EPOLL, WAIT_FLOCK };
+enum wait_kind {
+    WAIT_READ,
+    WAIT_PPOLL,
+    WAIT_PSELECT,
+    WAIT_EPOLL,
+    WAIT_FLOCK,
+    WAIT_FUTEX,
+};
+
+static int futex_word;
 
 static enum wait_kind kind;
 static char lock_path[] = "/tmp/elfuse-wait-process-signal-XXXXXX";
@@ -90,6 +102,9 @@ static int wait_once(int idx)
         errno = saved;
         return rc;
     }
+    case WAIT_FUTEX:
+        return (int) syscall(SYS_futex, &futex_word, FUTEX_WAIT_PRIVATE, 0,
+                             NULL);
     }
     return -1;
 }
@@ -120,6 +135,8 @@ static void release_waiters(pthread_t *th, int started, int holder)
         ssize_t n = write(pipes[i][1], "x", 1);
         (void) n;
     }
+    futex_word = 1;
+    syscall(SYS_futex, &futex_word, FUTEX_WAKE_PRIVATE, INT_MAX, NULL);
     for (int i = 0; i < started; i++)
         pthread_join(th[i], NULL);
     for (int i = 0; i < WAITERS; i++) {
@@ -140,6 +157,7 @@ static int send_one_signal(int *runs, int *woke)
     atomic_store_explicit(&handler_runs, 0, memory_order_relaxed);
     atomic_store_explicit(&armed, 0, memory_order_relaxed);
     atomic_store_explicit(&interrupted, 0, memory_order_relaxed);
+    futex_word = 0;
 
     int holder = -1;
     if (kind == WAIT_FLOCK) {
@@ -203,6 +221,7 @@ static void check_kind(enum wait_kind k, const char *name)
      * than a certainty.
      */
     int runs = 0, woke = 0;
+    bool observed = false;
     for (int round = 0; round < ROUNDS; round++) {
         int rc = send_one_signal(&runs, &woke);
         if (rc != 0) {
@@ -212,9 +231,12 @@ static void check_kind(enum wait_kind k, const char *name)
         }
         if (runs != 1 || woke > 1)
             break;
+        observed = observed || woke == 1;
     }
 
-    if (runs == 1 && woke <= 1) {
+    if (runs == 1 && woke <= 1 && !observed) {
+        FAIL("no round caught a waiter parked, so nothing was tested");
+    } else if (runs == 1 && woke <= 1) {
         PASS();
     } else {
         char msg[96];
@@ -251,6 +273,7 @@ int main(void)
     check_kind(WAIT_PSELECT, "pselect6");
     check_kind(WAIT_EPOLL, "epoll_pwait");
     check_kind(WAIT_FLOCK, "flock");
+    check_kind(WAIT_FUTEX, "futex");
 
     unlink(lock_path);
     SUMMARY("test-wait-process-signal");

@@ -351,13 +351,15 @@ static inline bool futex_uaddr_is_aligned(uint64_t uaddr)
  * 4), so this drops b->lock and retakes it. The caller must re-check
  * waiter.woken afterward: a wake can land in the window.
  *
- * Returns whether a deliverable signal is queued for this thread.
+ * Returns whether a deliverable signal is queued for this thread, claimed so a
+ * sibling woken by the same process-directed signal does not also report EINTR
+ * for it.
  */
 static bool futex_poll_signal_relock(futex_bucket_t *b)
 {
     pthread_mutex_unlock(&b->lock);
     signal_check_timer_real();
-    bool sig_ready = signal_pending() != 0;
+    bool sig_ready = signal_claim_interruption();
     pthread_mutex_lock(&b->lock);
     return sig_ready;
 }
@@ -974,11 +976,12 @@ static int64_t futex_os_sync_wait(guest_t *g,
         /* Return EINTR only when a real deliverable signal is queued for this
          * thread. POSIX callers (e.g. glibc sem_wait, foot's render worker)
          * often do not retry on EINTR, so synthetic spurious wakeups cannot be
-         * issued here. signal_pending() confirms under sig_lock so the atomic
-         * hint cannot produce a stale-true edge after rt_sigprocmask masked the
-         * queued signal.
+         * issued here. The claim confirms under sig_lock, so the atomic hint
+         * cannot produce a stale-true edge after rt_sigprocmask masked the
+         * queued signal, and takes a process-directed signal for this thread so
+         * a sibling woken by the same one does not report EINTR for it too.
          */
-        if (signal_pending()) {
+        if (signal_claim_interruption()) {
             if (has_timeout)
                 syscall_restart_forbid();
             return -LINUX_EINTR;
@@ -1201,7 +1204,7 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
             break;
         }
 
-        /* The slow-path confirm inside signal_pending() avoids the stale-true
+        /* The confirm under sig_lock inside the claim avoids the stale-true
          * edge the atomic hint can carry after rt_sigprocmask masks the queued
          * signal. Re-check waiter.woken below: a wake can land in the window
          * the poll opens.

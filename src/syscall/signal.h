@@ -623,6 +623,12 @@ void signal_defer_restore_blocked(uint64_t saved);
  */
 void signal_restore_saved_blocked(void);
 
+/* Drop the claims @t holds on process-directed signals, so another thread can
+ * take them. thread_deactivate() calls this before the slot can be reused.
+ */
+struct thread_entry;
+void signal_release_claims(struct thread_entry *t);
+
 /* Guest ITIMER_REAL emulation. These emulate the guest's setitimer(ITIMER_REAL)
  * internally rather than forwarding to the host, because macOS shares alarm()
  * and setitimer() as the same underlying timer, and elfuse needs alarm() for
