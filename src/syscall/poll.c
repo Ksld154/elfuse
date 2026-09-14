@@ -308,6 +308,7 @@ int64_t sys_ppoll(guest_t *g,
     /* Atomically install signal mask for the duration of the poll */
     uint64_t saved_mask = 0;
     bool mask_installed = false;
+    bool signal_interrupted = false;
     if (sigmask_gva != 0) {
         uint64_t new_mask;
         if (guest_read_small(g, sigmask_gva, &new_mask, sizeof(new_mask)) < 0) {
@@ -360,7 +361,13 @@ ppoll_retry:
         if (unpollable_count > 0)
             unpollable_ready = poll_eval_unpollable(unpollable, nfds);
 
-        int slice = (poll_timeout_ms == 0 || unpollable_ready > 0)
+        /* A signal already pending when the wait starts ends it after one
+         * non-blocking pass, the way Linux do_poll() finds it on its first
+         * pass; parked instead, the wait would sit out a slice before looking.
+         * The pass still runs, so ready descriptors win.
+         */
+        int slice = (poll_timeout_ms == 0 || unpollable_ready > 0 ||
+                     signal_pending_interruption(NULL))
                         ? 0
                         : poll_slice_ms(deadline_ms);
         ret = poll(host_fds, nfds + added_wakeup, slice);
@@ -383,9 +390,27 @@ ppoll_retry:
                 goto ppoll_retry;
         }
 
-        /* Check for process/thread interrupts after waking. */
-        if (thread_stop_requested() || futex_interrupt_consume() ||
-            signal_pending_interruption(NULL)) {
+        /* Check for process/thread interrupts after waking. The signal is
+         * claimed, not just seen: every thread in poll() returns on the same
+         * wakeup byte, and only one of them may report EINTR for it.
+         *
+         * Ready descriptors outrank the signal, as in Linux do_poll(), which
+         * looks at signal_pending() only for a pass that found nothing: EINTR
+         * would drop the events, and a claim would spend the process's one
+         * signal on a call that does not report it. sys_epoll_pwait gates its
+         * check the same way.
+         */
+        int wake_ready =
+            added_wakeup && ret > 0 && (host_fds[nfds].revents & POLLIN) ? 1
+                                                                         : 0;
+        bool events =
+            ret > wake_ready || unpollable_ready > 0 || invalid_count > 0;
+        bool stopped = thread_stop_requested();
+        if (!stopped && !events) {
+            stopped = futex_interrupt_consume();
+            signal_interrupted = !stopped && signal_claim_interruption();
+        }
+        if (stopped || signal_interrupted) {
             /* Finite wait: part of the guest's timeout is already spent. */
             if (deadline_ms >= 0)
                 syscall_restart_forbid();
@@ -460,9 +485,17 @@ ppoll_retry:
             goto ppoll_retry;
     }
 
-    /* Restore original signal mask */
-    if (mask_installed)
-        signal_restore_blocked(saved_mask);
+    /* Restore the original signal mask, unless a signal this wait claimed ended
+     * it: Linux delivers that one under the temporary mask and puts the
+     * original back at sigreturn, so a signal only the temporary mask unblocks
+     * still reaches its handler.
+     */
+    if (mask_installed) {
+        if (signal_interrupted)
+            signal_defer_restore_blocked(saved_mask);
+        else
+            signal_restore_blocked(saved_mask);
+    }
 
     host_fd_refs_close(host_refs, nfds);
 
@@ -776,6 +809,8 @@ int64_t sys_pselect6(guest_t *g,
      */
     uint64_t saved_blocked = 0;
     bool mask_applied = false;
+    bool signal_interrupted = false;
+    bool signal_first = false;
     if (sigmask_gva) {
         struct {
             uint64_t ss, ss_len;
@@ -815,20 +850,20 @@ int64_t sys_pselect6(guest_t *g,
     }
 
     struct timespec poll_ts = {.tv_sec = 0, .tv_nsec = 200000000L}; /* 200ms */
+    struct timespec zero_ts = {0, 0};
 
     /* Save fd_sets because pselect modifies them in-place to indicate ready
-     * fds. Without saving/restoring, the indefinite retry loop would operate on
-     * corrupted (zeroed) fd_sets after a 200ms timeout iteration.
+     * fds. Without saving/restoring, a retry pass -- an indefinite wait's 200ms
+     * slice, or the non-blocking pass a pending signal forces -- would operate
+     * on corrupted (zeroed) fd_sets.
      */
     fd_set saved_read, saved_write, saved_except;
-    if (!has_timeout) {
-        if (read_setp)
-            saved_read = read_set;
-        if (write_setp)
-            saved_write = write_set;
-        if (except_setp)
-            saved_except = except_set;
-    }
+    if (read_setp)
+        saved_read = read_set;
+    if (write_setp)
+        saved_write = write_set;
+    if (except_setp)
+        saved_except = except_set;
 
     bool use_poll_fallback = false;
     for (int i = 0; i < req_count; i++) {
@@ -853,19 +888,24 @@ pselect_retry:
     for (int i = 0; i < req_count; i++)
         reqs[i].revents = 0;
     do {
-        if (!has_timeout) {
-            if (read_setp)
-                read_set = saved_read;
-            if (write_setp)
-                write_set = saved_write;
-            if (except_setp)
-                except_set = saved_except;
-        }
+        if (read_setp)
+            read_set = saved_read;
+        if (write_setp)
+            write_set = saved_write;
+        if (except_setp)
+            except_set = saved_except;
+
+        /* A signal already pending ends the wait after one non-blocking pass;
+         * see ppoll. A finite wait has no wakeup pipe, so without this it would
+         * notice the signal only once its whole timeout had run.
+         */
+        signal_first = signal_pending_interruption(NULL);
+        const struct timespec *wait_ts =
+            signal_first ? &zero_ts : (has_timeout ? &ts : &poll_ts);
 
         if (use_poll_fallback) {
             bool restart;
-            ret = pselect_fallback_pass(&fb, has_timeout ? &ts : &poll_ts,
-                                        &restart);
+            ret = pselect_fallback_pass(&fb, wait_ts, &restart);
 
             /* The interrupt predicates below call into the runtime and can
              * overwrite errno, so an allocation failure leaves the loop here.
@@ -876,11 +916,20 @@ pselect_retry:
                 goto pselect_retry;
         } else {
             ret = pselect(max_host_fd + 1, read_setp, write_setp, except_setp,
-                          has_timeout ? &ts : &poll_ts, NULL);
+                          wait_ts, NULL);
         }
 
-        if (thread_stop_requested() || futex_interrupt_consume() ||
-            signal_pending_interruption(NULL)) {
+        /* Ready descriptors outrank the signal; see ppoll. */
+        bool wake_hit = added_wakeup && ret > 0 &&
+                        (use_poll_fallback ? fb.wakeup_fired
+                                           : FD_ISSET(wake_fd, &read_set));
+        bool events = ret > (wake_hit ? 1 : 0) || fb.ready > 0;
+        bool stopped = thread_stop_requested();
+        if (!stopped && !events) {
+            stopped = futex_interrupt_consume();
+            signal_interrupted = !stopped && signal_claim_interruption();
+        }
+        if (stopped || signal_interrupted) {
             /* Finite wait: part of the guest's timeout is already spent. */
             if (has_timeout)
                 syscall_restart_forbid();
@@ -888,7 +937,7 @@ pselect_retry:
             errno = EINTR;
             break;
         }
-    } while (ret == 0 && fb.ready == 0 && !has_timeout);
+    } while (ret == 0 && fb.ready == 0 && (!has_timeout || signal_first));
 
     int save_errno = errno;
 
@@ -908,9 +957,13 @@ pselect_retry:
             goto pselect_retry;
     }
 
-    /* Restore original signal mask */
-    if (mask_applied)
-        signal_restore_blocked(saved_blocked);
+    /* Restore the original signal mask; see ppoll for the claimed signal. */
+    if (mask_applied) {
+        if (signal_interrupted)
+            signal_defer_restore_blocked(saved_blocked);
+        else
+            signal_restore_blocked(saved_blocked);
+    }
 
     for (int i = 0; i < req_count; i++)
         host_fd_ref_close(&reqs[i].ref);
@@ -1951,6 +2004,8 @@ int64_t sys_epoll_pwait(guest_t *g,
     /* Atomically install signal mask for the duration of the wait */
     uint64_t saved_mask = 0;
     bool mask_installed = false;
+    bool signal_interrupted = false;
+    bool signal_first = false;
     if (sigmask_gva != 0) {
         uint64_t new_mask;
         if (guest_read_small(g, sigmask_gva, &new_mask, sizeof(new_mask)) ==
@@ -1996,8 +2051,15 @@ int64_t sys_epoll_pwait(guest_t *g,
     struct timespec poll_ts = {.tv_sec = 0, .tv_nsec = 200000000L}; /* 200ms */
     int nready;
     do {
+        /* A signal already pending ends the wait after one non-blocking pass;
+         * see ppoll. A finite wait hands kevent its whole timeout, so without
+         * this it would notice the signal only once that had run.
+         */
+        signal_first = !hup_ready && signal_pending_interruption(NULL);
         nready = kevent(epoll_ref.fd, NULL, 0, kevents, cap,
-                        hup_ready ? &zero_ts : (has_timeout ? &ts : &poll_ts));
+                        (hup_ready || signal_first)
+                            ? &zero_ts
+                            : (has_timeout ? &ts : &poll_ts));
         if (nready > 0) {
         }
 
@@ -2027,9 +2089,11 @@ int64_t sys_epoll_pwait(guest_t *g,
          */
         bool interrupted = thread_stop_requested() &&
                            !(nready > 0 && thread_stop_is_leader_work_only());
-        if (!interrupted && nready <= 0)
-            interrupted =
-                futex_interrupt_consume() || signal_pending_interruption(NULL);
+        if (!interrupted && nready <= 0) {
+            interrupted = futex_interrupt_consume();
+            signal_interrupted = !interrupted && signal_claim_interruption();
+            interrupted = interrupted || signal_interrupted;
+        }
         if (interrupted) {
             /* Finite wait: part of the guest's timeout is already spent. */
             if (has_timeout)
@@ -2048,13 +2112,17 @@ int64_t sys_epoll_pwait(guest_t *g,
             if (hup_ready)
                 break;
         }
-    } while (nready == 0 && !has_timeout);
+    } while (nready == 0 && (!has_timeout || signal_first));
 
     int saved_errno = errno;
 
-    /* Restore original signal mask after the blocking wait */
-    if (mask_installed)
-        signal_restore_blocked(saved_mask);
+    /* Restore the original signal mask; see ppoll for the claimed signal. */
+    if (mask_installed) {
+        if (signal_interrupted)
+            signal_defer_restore_blocked(saved_mask);
+        else
+            signal_restore_blocked(saved_mask);
+    }
 
     if (nready < 0) {
         errno = saved_errno;

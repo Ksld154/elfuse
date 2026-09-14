@@ -413,6 +413,20 @@ $(BUILD_DIR)/test-nanosleep-process-signal: \
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+# test-wait-process-signal parks several threads in each blocking wait and sends
+# the group one signal.
+$(BUILD_DIR)/test-wait-process-signal: \
+		tests/test-wait-process-signal.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-wait-sigmask-signal signals a wait from a second thread while the wait's
+# own sigmask is the only one that unblocks it.
+$(BUILD_DIR)/test-wait-sigmask-signal: \
+		tests/test-wait-sigmask-signal.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # test-socket-waitall drips the tail of a MSG_WAITALL request from a second
 # thread.
 $(BUILD_DIR)/test-socket-waitall: tests/test-socket-waitall.c | $(BUILD_DIR)

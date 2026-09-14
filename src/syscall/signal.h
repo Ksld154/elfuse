@@ -609,6 +609,26 @@ uint64_t signal_save_blocked(void);
 void signal_set_blocked(uint64_t mask);
 void signal_restore_blocked(uint64_t saved);
 
+/* Leave a wait's temporary mask installed for the signal that ended it, and
+ * hand @saved to the next handler frame as uc_sigmask so rt_sigreturn restores
+ * it. ppoll, pselect6 and epoll_pwait call this when they return EINTR for a
+ * signal they claimed, which is where Linux keeps the mask for ERESTARTNOHAND.
+ */
+void signal_defer_restore_blocked(uint64_t saved);
+
+/* Put back a mask left for delivery -- by signal_defer_restore_blocked() or
+ * rt_sigsuspend -- that no handler frame took, because the signal was discarded
+ * or a stop came first. The syscall epilogue calls this after it delivers, as
+ * Linux restore_saved_sigmask() does.
+ */
+void signal_restore_saved_blocked(void);
+
+/* Drop the claims @t holds on process-directed signals, so another thread can
+ * take them. thread_deactivate() calls this before the slot can be reused.
+ */
+struct thread_entry;
+void signal_release_claims(struct thread_entry *t);
+
 /* Guest ITIMER_REAL emulation. These emulate the guest's setitimer(ITIMER_REAL)
  * internally rather than forwarding to the host, because macOS shares alarm()
  * and setitimer() as the same underlying timer, and elfuse needs alarm() for
