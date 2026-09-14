@@ -308,6 +308,7 @@ int64_t sys_ppoll(guest_t *g,
     /* Atomically install signal mask for the duration of the poll */
     uint64_t saved_mask = 0;
     bool mask_installed = false;
+    bool signal_interrupted = false;
     if (sigmask_gva != 0) {
         uint64_t new_mask;
         if (guest_read_small(g, sigmask_gva, &new_mask, sizeof(new_mask)) < 0) {
@@ -387,8 +388,9 @@ ppoll_retry:
          * claimed, not just seen: every thread in poll() returns on the same
          * wakeup byte, and only one of them may report EINTR for it.
          */
-        if (thread_stop_requested() || futex_interrupt_consume() ||
-            signal_claim_interruption_masked(saved_mask)) {
+        bool stopped = thread_stop_requested() || futex_interrupt_consume();
+        signal_interrupted = !stopped && signal_claim_interruption();
+        if (stopped || signal_interrupted) {
             /* Finite wait: part of the guest's timeout is already spent. */
             if (deadline_ms >= 0)
                 syscall_restart_forbid();
@@ -463,9 +465,17 @@ ppoll_retry:
             goto ppoll_retry;
     }
 
-    /* Restore original signal mask */
-    if (mask_installed)
-        signal_restore_blocked(saved_mask);
+    /* Restore the original signal mask, unless a signal this wait claimed ended
+     * it: Linux delivers that one under the temporary mask and puts the
+     * original back at sigreturn, so a signal only the temporary mask unblocks
+     * still reaches its handler.
+     */
+    if (mask_installed) {
+        if (signal_interrupted)
+            signal_defer_restore_blocked(saved_mask);
+        else
+            signal_restore_blocked(saved_mask);
+    }
 
     host_fd_refs_close(host_refs, nfds);
 
@@ -779,6 +789,7 @@ int64_t sys_pselect6(guest_t *g,
      */
     uint64_t saved_blocked = 0;
     bool mask_applied = false;
+    bool signal_interrupted = false;
     if (sigmask_gva) {
         struct {
             uint64_t ss, ss_len;
@@ -882,8 +893,9 @@ pselect_retry:
                           has_timeout ? &ts : &poll_ts, NULL);
         }
 
-        if (thread_stop_requested() || futex_interrupt_consume() ||
-            signal_claim_interruption_masked(saved_blocked)) {
+        bool stopped = thread_stop_requested() || futex_interrupt_consume();
+        signal_interrupted = !stopped && signal_claim_interruption();
+        if (stopped || signal_interrupted) {
             /* Finite wait: part of the guest's timeout is already spent. */
             if (has_timeout)
                 syscall_restart_forbid();
@@ -911,9 +923,13 @@ pselect_retry:
             goto pselect_retry;
     }
 
-    /* Restore original signal mask */
-    if (mask_applied)
-        signal_restore_blocked(saved_blocked);
+    /* Restore the original signal mask; see ppoll for the claimed signal. */
+    if (mask_applied) {
+        if (signal_interrupted)
+            signal_defer_restore_blocked(saved_blocked);
+        else
+            signal_restore_blocked(saved_blocked);
+    }
 
     for (int i = 0; i < req_count; i++)
         host_fd_ref_close(&reqs[i].ref);
@@ -1954,6 +1970,7 @@ int64_t sys_epoll_pwait(guest_t *g,
     /* Atomically install signal mask for the duration of the wait */
     uint64_t saved_mask = 0;
     bool mask_installed = false;
+    bool signal_interrupted = false;
     if (sigmask_gva != 0) {
         uint64_t new_mask;
         if (guest_read_small(g, sigmask_gva, &new_mask, sizeof(new_mask)) ==
@@ -2030,9 +2047,11 @@ int64_t sys_epoll_pwait(guest_t *g,
          */
         bool interrupted = thread_stop_requested() &&
                            !(nready > 0 && thread_stop_is_leader_work_only());
-        if (!interrupted && nready <= 0)
-            interrupted = futex_interrupt_consume() ||
-                          signal_claim_interruption_masked(saved_mask);
+        if (!interrupted && nready <= 0) {
+            interrupted = futex_interrupt_consume();
+            signal_interrupted = !interrupted && signal_claim_interruption();
+            interrupted = interrupted || signal_interrupted;
+        }
         if (interrupted) {
             /* Finite wait: part of the guest's timeout is already spent. */
             if (has_timeout)
@@ -2055,9 +2074,13 @@ int64_t sys_epoll_pwait(guest_t *g,
 
     int saved_errno = errno;
 
-    /* Restore original signal mask after the blocking wait */
-    if (mask_installed)
-        signal_restore_blocked(saved_mask);
+    /* Restore the original signal mask; see ppoll for the claimed signal. */
+    if (mask_installed) {
+        if (signal_interrupted)
+            signal_defer_restore_blocked(saved_mask);
+        else
+            signal_restore_blocked(saved_mask);
+    }
 
     if (nready < 0) {
         errno = saved_errno;

@@ -455,13 +455,6 @@ bool signal_pending_interruption(bool *restart_out);
  */
 bool signal_claim_interruption(void);
 
-/* signal_claim_interruption() for a wait that runs under a temporary mask and
- * puts @saved_blocked back before the syscall epilogue delivers (ppoll,
- * pselect6, epoll_pwait). A signal that only the temporary mask unblocks is
- * reported without being claimed. Pass 0 when no mask was installed.
- */
-bool signal_claim_interruption_masked(uint64_t saved_blocked);
-
 /* True if anything that would normally be drained by signal_check_timer is
  * currently live: an unblocked pending signal, OR any of the three guest
  * itimers is armed. The shim's identity fast path consults this (indirectly via
@@ -615,6 +608,20 @@ uint64_t signal_signalfd_pending_mask(void);
 uint64_t signal_save_blocked(void);
 void signal_set_blocked(uint64_t mask);
 void signal_restore_blocked(uint64_t saved);
+
+/* Leave a wait's temporary mask installed for the signal that ended it, and
+ * hand @saved to the next handler frame as uc_sigmask so rt_sigreturn restores
+ * it. ppoll, pselect6 and epoll_pwait call this when they return EINTR for a
+ * signal they claimed, which is where Linux keeps the mask for ERESTARTNOHAND.
+ */
+void signal_defer_restore_blocked(uint64_t saved);
+
+/* Put back a mask left for delivery -- by signal_defer_restore_blocked() or
+ * rt_sigsuspend -- that no handler frame took, because the signal was discarded
+ * or a stop came first. The syscall epilogue calls this after it delivers, as
+ * Linux restore_saved_sigmask() does.
+ */
+void signal_restore_saved_blocked(void);
 
 /* Guest ITIMER_REAL emulation. These emulate the guest's setitimer(ITIMER_REAL)
  * internally rather than forwarding to the host, because macOS shares alarm()

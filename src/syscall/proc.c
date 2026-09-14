@@ -4123,6 +4123,12 @@ static bool syscall_return_epilogue(guest_t *g,
             frame_restored = false; /* committed to a handler frame: X8 = 2 */
     }
 
+    /* A temporary mask a wait left for this delivery comes back now if no frame
+     * took it. A deferred stop delivers at HVC #13 and restores there.
+     */
+    if (!defer_stop)
+        signal_restore_saved_blocked();
+
     /* X7 asks the shim to restore its SVC frame and enter HVC #13 for this
      * stop. Written only on the tails that do restore the frame, which put the
      * guest's own X7 back before the ERET. The flag beside it is what lets the
@@ -4304,6 +4310,7 @@ static vcpu_action_t vcpu_handle_exception_exit(guest_t *g,
             }
             cpu_ptrace_stop_armed = false;
             running = ptrace_take_stop(g, vcpu, exit_code);
+            signal_restore_saved_blocked();
             break;
 
         case 2: {

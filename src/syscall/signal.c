@@ -1122,6 +1122,34 @@ void signal_restore_blocked(uint64_t saved)
     pthread_mutex_unlock(&sig_lock);
 }
 
+void signal_defer_restore_blocked(uint64_t saved)
+{
+    uint64_t unmaskable = sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP);
+    pthread_mutex_lock(&sig_lock);
+    *thread_saved_blocked_ptr() = saved & ~unmaskable;
+    *thread_saved_valid_ptr() = true;
+    pthread_mutex_unlock(&sig_lock);
+}
+
+void signal_restore_saved_blocked(void)
+{
+    /* Every syscall epilogue calls this, so skip sig_lock when nothing was
+     * left. Only the owning thread writes its saved_blocked_valid, which makes
+     * the unlocked read its own.
+     */
+    bool *valid = thread_saved_valid_ptr();
+    if (!*valid)
+        return;
+
+    pthread_mutex_lock(&sig_lock);
+    if (*valid) {
+        atomic_store_explicit(thread_blocked_ptr(), *thread_saved_blocked_ptr(),
+                              memory_order_release);
+        *valid = false;
+    }
+    pthread_mutex_unlock(&sig_lock);
+}
+
 /* Guest ITIMER_REAL API. */
 
 /* Get monotonic time as timeval. Uses CLOCK_MONOTONIC to avoid NTP drift;
@@ -1648,11 +1676,6 @@ static int signal_claim_waking_locked(uint64_t blocked)
 
 bool signal_claim_interruption(void)
 {
-    return signal_claim_interruption_masked(0);
-}
-
-bool signal_claim_interruption_masked(uint64_t saved_blocked)
-{
     /* Same lock-free fast path as signal_pending(). */
     uint64_t hint =
         atomic_load_explicit(&sig_pending_hint, memory_order_acquire);
@@ -1663,16 +1686,9 @@ bool signal_claim_interruption_masked(uint64_t saved_blocked)
 
     pthread_mutex_lock(&sig_lock);
     blocked = atomic_load_explicit(thread_blocked_ptr(), memory_order_acquire);
-
-    /* Claim only what this thread can deliver once @saved_blocked is back. A
-     * signal only the temporary mask unblocks still ends the wait, but it stays
-     * shared: signal_deliver() tests the restored mask, and binding it here
-     * would take it away from a sibling that could run the handler.
-     */
-    bool woke = signal_claim_waking_locked(blocked | saved_blocked) != 0 ||
-                signal_set_would_wake_locked(self_pending_locked() & ~blocked);
+    bool claimed = signal_claim_waking_locked(blocked) != 0;
     pthread_mutex_unlock(&sig_lock);
-    return woke;
+    return claimed;
 }
 
 /* rt_sigsuspend. */
