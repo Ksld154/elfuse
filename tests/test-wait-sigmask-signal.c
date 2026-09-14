@@ -158,6 +158,16 @@ static void check_kind(enum wait_kind kind, const char *name)
     int saved = errno;
     atomic_store_explicit(&wait_returned, 1, memory_order_release);
     pthread_join(th, NULL);
+
+    /* A byte the watchdog wrote would make every later wait here return ready;
+     * take it so a failure above does not cascade into the checks below.
+     */
+    struct pollfd leftover = {.fd = p[0], .events = POLLIN};
+    if (poll(&leftover, 1, 0) == 1) {
+        char c;
+        ssize_t n = read(p[0], &c, 1);
+        (void) n;
+    }
     int runs = atomic_load_explicit(&handler_runs, memory_order_acquire);
     if (ret == -1 && saved == EINTR && runs == 1) {
         PASS();
