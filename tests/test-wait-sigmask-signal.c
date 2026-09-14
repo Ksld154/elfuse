@@ -22,6 +22,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/select.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "test-harness.h"
@@ -44,34 +45,57 @@ static void on_signal(int sig)
     atomic_fetch_add_explicit(&handler_runs, 1, memory_order_relaxed);
 }
 
+static _Atomic int wait_returned;
+
+/* Signal the group, then stand in for a timeout: a wait the signal never
+ * reaches gets a byte on the pipe after 5 s and returns ready, which fails the
+ * check instead of hanging the lane.
+ */
 static void *killer(void *arg)
 {
-    (void) arg;
+    int wfd = *(int *) arg;
     usleep(100000);
     kill(getpid(), SIGUSR1);
+    for (int i = 0; i < 500; i++) {
+        if (atomic_load_explicit(&wait_returned, memory_order_acquire))
+            return NULL;
+        usleep(10000);
+    }
+    ssize_t n = write(wfd, "x", 1);
+    (void) n;
     return NULL;
 }
 
-/* One wait on @rfd under @mask with no timeout. */
+static long long now_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long long) t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+/* One wait on @rfd under @mask, for @timeout_ms or with no timeout when -1. */
 static int wait_masked(enum wait_kind kind,
                        int rfd,
                        int epfd,
-                       const sigset_t *mask)
+                       const sigset_t *mask,
+                       int timeout_ms)
 {
+    struct timespec ts = {timeout_ms / 1000, (timeout_ms % 1000) * 1000000L};
+    struct timespec *tsp = timeout_ms < 0 ? NULL : &ts;
     switch (kind) {
     case WAIT_PPOLL: {
         struct pollfd p = {.fd = rfd, .events = POLLIN};
-        return ppoll(&p, 1, NULL, mask);
+        return ppoll(&p, 1, tsp, mask);
     }
     case WAIT_PSELECT: {
         fd_set set;
         FD_ZERO(&set);
         FD_SET(rfd, &set);
-        return pselect(rfd + 1, &set, NULL, NULL, NULL, mask);
+        return pselect(rfd + 1, &set, NULL, NULL, tsp, mask);
     }
     case WAIT_EPOLL: {
         struct epoll_event ev;
-        return epoll_pwait(epfd, &ev, 1, -1, mask);
+        return epoll_pwait(epfd, &ev, 1, timeout_ms, mask);
     }
     }
     return -1;
@@ -101,6 +125,10 @@ static void check_kind(enum wait_kind kind, const char *name)
     if (epfd < 0 || epoll_ctl(epfd, EPOLL_CTL_ADD, p[0], &ev) < 0) {
         TEST(name);
         FAIL("epoll setup failed");
+        if (epfd >= 0)
+            close(epfd);
+        close(p[0]);
+        close(p[1]);
         return;
     }
 
@@ -115,15 +143,20 @@ static void check_kind(enum wait_kind kind, const char *name)
     TEST(label);
     atomic_store_explicit(&handler_runs, 0, memory_order_relaxed);
     atomic_store_explicit(&handler_saw_usr2_blocked, 0, memory_order_relaxed);
+    atomic_store_explicit(&wait_returned, 0, memory_order_relaxed);
     pthread_t th;
-    int rc = pthread_create(&th, NULL, killer, NULL);
+    int rc = pthread_create(&th, NULL, killer, &p[1]);
     if (rc != 0) {
         errno = rc;
         FAIL("pthread_create failed");
+        close(epfd);
+        close(p[0]);
+        close(p[1]);
         return;
     }
-    int ret = wait_masked(kind, p[0], epfd, &wait_mask);
+    int ret = wait_masked(kind, p[0], epfd, &wait_mask, -1);
     int saved = errno;
+    atomic_store_explicit(&wait_returned, 1, memory_order_release);
     pthread_join(th, NULL);
     int runs = atomic_load_explicit(&handler_runs, memory_order_acquire);
     if (ret == -1 && saved == EINTR && runs == 1) {
@@ -157,11 +190,74 @@ static void check_kind(enum wait_kind kind, const char *name)
     if (write(p[1], "x", 1) != 1) {
         FAIL("write failed");
     } else {
-        ret = wait_masked(kind, p[0], epfd, &wait_mask);
+        ret = wait_masked(kind, p[0], epfd, &wait_mask, -1);
         if (ret == 1 && mask_is_original())
             PASS();
         else
             FAIL("ready wait did not restore the original mask");
+        char c;
+        ssize_t n = read(p[0], &c, 1);
+        (void) n;
+    }
+
+    /* A signal already pending when the wait starts ends it at once. With a
+     * timeout this is the case a finite wait could otherwise sit out in full,
+     * since nothing arrives during the wait to wake it.
+     */
+    snprintf(label, sizeof(label), "%s: pending at entry", name);
+    TEST(label);
+    atomic_store_explicit(&handler_runs, 0, memory_order_relaxed);
+    kill(getpid(), SIGUSR1);
+    long long start = now_ms();
+    ret = wait_masked(kind, p[0], epfd, &wait_mask, 5000);
+    saved = errno;
+    long long spent = now_ms() - start;
+    runs = atomic_load_explicit(&handler_runs, memory_order_acquire);
+    if (ret == -1 && saved == EINTR && runs == 1 && spent < 1000) {
+        PASS();
+    } else {
+        char msg[96];
+        snprintf(msg, sizeof(msg),
+                 "ret=%d errno=%d handler ran %d times, %lld ms", ret, saved,
+                 runs, spent);
+        FAIL(msg);
+    }
+
+    /* Ready descriptors outrank a pending signal, as in Linux do_poll() and
+     * ep_poll(): the wait reports them, puts the original mask back, and leaves
+     * the signal pending under it rather than spending it on EINTR.
+     */
+    snprintf(label, sizeof(label), "%s: ready beats signal", name);
+    TEST(label);
+    atomic_store_explicit(&handler_runs, 0, memory_order_relaxed);
+    if (write(p[1], "x", 1) != 1) {
+        FAIL("write failed");
+    } else {
+        kill(getpid(), SIGUSR1);
+        ret = wait_masked(kind, p[0], epfd, &wait_mask, 5000);
+        runs = atomic_load_explicit(&handler_runs, memory_order_acquire);
+        sigset_t pend;
+        sigpending(&pend);
+        bool still_pending = sigismember(&pend, SIGUSR1);
+        if (ret == 1 && runs == 0 && still_pending && mask_is_original()) {
+            PASS();
+        } else {
+            char msg[96];
+            snprintf(msg, sizeof(msg),
+                     "ret=%d handler ran %d times, pending=%d", ret, runs,
+                     still_pending);
+            FAIL(msg);
+        }
+
+        /* Consume what this check left behind. */
+        char c;
+        ssize_t n = read(p[0], &c, 1);
+        (void) n;
+        sigset_t usr1;
+        sigemptyset(&usr1);
+        sigaddset(&usr1, SIGUSR1);
+        struct timespec zero = {0, 0};
+        sigtimedwait(&usr1, NULL, &zero);
     }
 
     close(epfd);
