@@ -724,6 +724,8 @@ run_unit_tests()
         "$bindir/test-nanosleep-signal-latency"
     test_check "$runner" "test-nanosleep-process-signal" "PASS" \
         "$bindir/test-nanosleep-process-signal"
+    test_check "$runner" "test-wait-signal-latency" "PASS" \
+        "$bindir/test-wait-signal-latency"
     test_check "$runner" "test-wait-process-signal" " - PASS" \
         "$bindir/test-wait-process-signal"
     test_check "$runner" "test-wait-sigmask-signal" " - PASS" \

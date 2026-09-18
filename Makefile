@@ -462,6 +462,13 @@ $(BUILD_DIR)/test-nanosleep-signal-latency: \
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+# test-wait-signal-latency aims a signal at a sibling thread parked in select or
+# epoll_wait.
+$(BUILD_DIR)/test-wait-signal-latency: \
+		tests/test-wait-signal-latency.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # test-nanosleep-process-signal parks several threads in a sleep and sends the
 # group one signal.
 $(BUILD_DIR)/test-nanosleep-process-signal: \
