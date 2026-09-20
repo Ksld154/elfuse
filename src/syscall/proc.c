@@ -1277,24 +1277,26 @@ typedef struct {
     bool found;
 } registry_find_ctx_t;
 
-/* Locate @target's guest pid without registry_parse_cb's per-record kill(2)
- * liveness probe: that check exists to build a filtered live- membership list
- * for group-signal delivery, but a host_pid ->guest_pid lookup is only ever
- * done for a pid the caller just observed to be alive (e.g. it holds a
- * conflicting file lock right now), so it is redundant here.
- * proc_host_to_guest_pid still verifies the match via proc_pidpath to guard
- * against the pid having been recycled.
+/* Locate @target's guest pid. The caller looks up a pid it just observed to be
+ * alive (e.g. it holds a conflicting file lock right now), but liveness alone
+ * does not say the record describes that process: an exited member's record
+ * outlives it, and macOS reuses host pids. The start time settles it, as it
+ * does in registry_parse_cb.
  */
 static void registry_find_by_host_cb(char *rec, void *vctx)
 {
     registry_find_ctx_t *c = vctx;
     long hp;
     long long gp, pg;
-    if (sscanf(rec, "%ld %lld %lld", &hp, &gp, &pg) != 3)
+    unsigned long long st;
+    if (sscanf(rec, "%ld %lld %lld %llu", &hp, &gp, &pg, &st) != 4)
         return;
     if (hp <= 0 || hp > INT_MAX || pg < 0 || pg > INT_MAX)
         return;
     if ((pid_t) hp != c->target)
+        return;
+    uint64_t live_us;
+    if (!host_start_us((pid_t) hp, &live_us) || live_us != (uint64_t) st)
         return;
     c->guest_pid = (int64_t) gp;
     c->found = true;
