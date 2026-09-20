@@ -418,7 +418,7 @@ int64_t proc_alloc_pid(void)
     if (!process_pid_sequence_path(path, sizeof(path)))
         return -LINUX_EAGAIN;
 
-    if (absock_get_namespace_id() == (uint64_t) getpid() &&
+    if (absock_namespace_is_owner() &&
         !atomic_exchange_explicit(&owner_sequence_reset, true,
                                   memory_order_relaxed))
         unlink(path);
@@ -749,7 +749,7 @@ static int lifecycle_open_locked(char *path, size_t path_size)
     static _Atomic bool owner_reset_done;
     if (!lifecycle_registry_path(path, path_size))
         return -1;
-    if (absock_get_namespace_id() == (uint64_t) getpid() &&
+    if (absock_namespace_is_owner() &&
         !atomic_exchange_explicit(&owner_reset_done, true,
                                   memory_order_relaxed))
         unlink(path);
@@ -1150,18 +1150,21 @@ static void lifecycle_import_children(void)
 static void proc_registry_reset_if_owner(const char *path)
 {
     static _Atomic bool reset_done;
-    if (absock_get_namespace_id() != (uint64_t) getpid())
+    if (!absock_namespace_is_owner())
         return;
     if (atomic_exchange_explicit(&reset_done, true, memory_order_relaxed))
         return;
     unlink(path);
 }
 
-/* One live member of a process group registry. */
+/* One live member of a process group registry. start_us is the host process's
+ * start time: a host pid alone matches whatever process macOS hands it to next.
+ */
 typedef struct {
     pid_t host_pid;
     int64_t guest_pid;
     int64_t pgid;
+    uint64_t start_us;
 } registry_entry_t;
 
 #define REGISTRY_MAX_ENTRIES 4096
@@ -1178,10 +1181,10 @@ static int flock_retry(int fd, int op)
 
 /* Read @fd from its current offset and invoke @cb once per newline-terminated
  * record, passing a NUL-terminated copy. Records must fit in 159 bytes; both
- * the registry ("hostpid guestpid pgid") and signal/control transport records
- * use bounded numeric lines. Overlong records and an unterminated trailing
- * token are dropped -- every writer appends a whole record under an exclusive
- * lock, so a partial line only appears after a crash mid-write.
+ * the registry ("hostpid guestpid pgid startus") and signal/control transport
+ * records use bounded numeric lines. Overlong records and an unterminated
+ * trailing token are dropped -- every writer appends a whole record under an
+ * exclusive lock, so a partial line only appears after a crash mid-write.
  */
 static void for_each_record(int fd, void (*cb)(char *rec, void *ctx), void *ctx)
 {
@@ -1217,19 +1220,37 @@ typedef struct {
     bool truncated;
 } registry_parse_ctx_t;
 
-/* Upsert one "hostpid guestpid pgid" record, keeping the latest guest_pid/pgid
- * per LIVE host pid. Dead, malformed, and out-of-range records are dropped.
+/* Start time of host process @pid in microseconds.
+ *
+ * Returns false once @pid has exited.
+ */
+static bool host_start_us(pid_t pid, uint64_t *out)
+{
+    struct proc_bsdinfo info;
+    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) !=
+        (int) sizeof(info))
+        return false;
+    *out = info.pbi_start_tvsec * 1000000ULL + info.pbi_start_tvusec;
+    return true;
+}
+
+/* Upsert one "hostpid guestpid pgid startus" record, keeping the latest
+ * guest_pid/pgid per LIVE host pid. A record whose start time differs from the
+ * running process's names an exited member whose host pid was reused, so it is
+ * dropped along with dead, malformed, and out-of-range records.
  */
 static void registry_parse_cb(char *rec, void *vctx)
 {
     registry_parse_ctx_t *c = vctx;
     long hp;
     long long gp, pg;
-    if (sscanf(rec, "%ld %lld %lld", &hp, &gp, &pg) != 3)
+    unsigned long long st;
+    if (sscanf(rec, "%ld %lld %lld %llu", &hp, &gp, &pg, &st) != 4)
         return;
     if (hp <= 0 || hp > INT_MAX || pg < 0 || pg > INT_MAX)
         return;
-    if (kill((pid_t) hp, 0) != 0)
+    uint64_t live_us;
+    if (!host_start_us((pid_t) hp, &live_us) || live_us != (uint64_t) st)
         return;
     int idx = -1;
     for (int k = 0; k < c->n; k++)
@@ -1244,6 +1265,7 @@ static void registry_parse_cb(char *rec, void *vctx)
         }
         idx = c->n++;
         c->entries[idx].host_pid = (pid_t) hp;
+        c->entries[idx].start_us = live_us;
     }
     c->entries[idx].guest_pid = (int64_t) gp;
     c->entries[idx].pgid = (int64_t) pg;
@@ -1255,24 +1277,26 @@ typedef struct {
     bool found;
 } registry_find_ctx_t;
 
-/* Locate @target's guest pid without registry_parse_cb's per-record kill(2)
- * liveness probe: that check exists to build a filtered live- membership list
- * for group-signal delivery, but a host_pid ->guest_pid lookup is only ever
- * done for a pid the caller just observed to be alive (e.g. it holds a
- * conflicting file lock right now), so it is redundant here.
- * proc_host_to_guest_pid still verifies the match via proc_pidpath to guard
- * against the pid having been recycled.
+/* Locate @target's guest pid. The caller looks up a pid it just observed to be
+ * alive (e.g. it holds a conflicting file lock right now), but liveness alone
+ * does not say the record describes that process: an exited member's record
+ * outlives it, and macOS reuses host pids. The start time settles it, as it
+ * does in registry_parse_cb.
  */
 static void registry_find_by_host_cb(char *rec, void *vctx)
 {
     registry_find_ctx_t *c = vctx;
     long hp;
     long long gp, pg;
-    if (sscanf(rec, "%ld %lld %lld", &hp, &gp, &pg) != 3)
+    unsigned long long st;
+    if (sscanf(rec, "%ld %lld %lld %llu", &hp, &gp, &pg, &st) != 4)
         return;
     if (hp <= 0 || hp > INT_MAX || pg < 0 || pg > INT_MAX)
         return;
     if ((pid_t) hp != c->target)
+        return;
+    uint64_t live_us;
+    if (!host_start_us((pid_t) hp, &live_us) || live_us != (uint64_t) st)
         return;
     c->guest_pid = (int64_t) gp;
     c->found = true;
@@ -1328,7 +1352,8 @@ static void proc_registry_publish(pid_t host_pid,
             idx = i;
             break;
         }
-    if (idx < 0) {
+    uint64_t start_us;
+    if (idx < 0 && host_start_us(host_pid, &start_us)) {
         if (n == REGISTRY_MAX_ENTRIES)
 
             /* No slot for a new live member: group signals (kill(-1),
@@ -1342,6 +1367,7 @@ static void proc_registry_publish(pid_t host_pid,
         else {
             idx = n++;
             entries[idx].host_pid = host_pid;
+            entries[idx].start_us = start_us;
         }
     }
     if (idx >= 0) {
@@ -1351,11 +1377,12 @@ static void proc_registry_publish(pid_t host_pid,
 
     if (ftruncate(fd, 0) == 0 && lseek(fd, 0, SEEK_SET) == 0) {
         for (int i = 0; i < n; i++) {
-            char lineb[64];
-            int len = snprintf(lineb, sizeof(lineb), "%ld %lld %lld\n",
+            char lineb[96];
+            int len = snprintf(lineb, sizeof(lineb), "%ld %lld %lld %llu\n",
                                (long) entries[i].host_pid,
                                (long long) entries[i].guest_pid,
-                               (long long) entries[i].pgid);
+                               (long long) entries[i].pgid,
+                               (unsigned long long) entries[i].start_us);
             if (len > 0 && (size_t) len < sizeof(lineb) &&
                 write_all(fd, lineb, (size_t) len) < 0)
                 break;
@@ -1708,9 +1735,14 @@ int proc_set_child_pgid(int64_t guest_pid_val, int64_t pgid)
     return ret;
 }
 
-int proc_get_namespace_targets(proc_signal_target_t *out,
-                               int max,
-                               int64_t pgid_filter)
+/* Shared body for the group/broadcast collector and the single-pid lookup.
+ * guest_filter of 0 accepts every member; a positive value stops at the one
+ * member carrying that guest pid.
+ */
+static int registry_collect(proc_signal_target_t *out,
+                            int max,
+                            int64_t pgid_filter,
+                            int64_t guest_filter)
 {
     /* No republish here: every group change already publishes (fork, setpgid,
      * setsid), and this reader excludes its own entry anyway.
@@ -1749,6 +1781,8 @@ int proc_get_namespace_targets(proc_signal_target_t *out,
             continue;
         if (pgid_filter != PROC_PGID_ANY && entries[i].pgid != pgid_filter)
             continue;
+        if (guest_filter > 0 && entries[i].guest_pid != guest_filter)
+            continue;
         char ppath[PROC_PIDPATHINFO_MAXSIZE];
         int plen = proc_pidpath(entries[i].host_pid, ppath, sizeof(ppath));
         if (plen != our_len || memcmp(ppath, our_path, (size_t) our_len))
@@ -1758,6 +1792,26 @@ int proc_get_namespace_targets(proc_signal_target_t *out,
         count++;
     }
     return count;
+}
+
+int proc_get_namespace_targets(proc_signal_target_t *out,
+                               int max,
+                               int64_t pgid_filter)
+{
+    return registry_collect(out, max, pgid_filter, 0);
+}
+
+pid_t proc_namespace_host_pid(int64_t guest_pid)
+{
+    /* registry_collect reads a guest_filter of 0 as "every member", so a caller
+     * passing 0 or a negative pid would get an arbitrary one.
+     */
+    if (guest_pid <= 0)
+        return -1;
+    proc_signal_target_t target;
+    return registry_collect(&target, 1, PROC_PGID_ANY, guest_pid) > 0
+               ? target.host_pid
+               : -1;
 }
 
 int64_t proc_host_to_guest_pid(pid_t host_pid)
@@ -3116,11 +3170,11 @@ static void unlink_own_transport(void)
     /* The namespace owner cleans the registry, but only once no other live
      * member still needs it: if the owner exits while fork children survive,
      * deleting the file would blind their kill(-1)/kill(0)/kill(-pgid). A rare
-     * orphaned family that outlives its owner leaves the file for the next
-     * same-pid run's reset (proc_registry_reset_if_owner) or the OS temp-dir
-     * purge.
+     * orphaned family that outlives its owner leaves its file for the OS
+     * temp-dir purge; no later run can claim it, since the name carries a
+     * minted id rather than a recyclable pid.
      */
-    if (absock_get_namespace_id() != (uint64_t) getpid())
+    if (!absock_namespace_is_owner())
         return;
     if (!process_registry_path(path, sizeof(path)))
         return;
