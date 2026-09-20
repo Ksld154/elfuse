@@ -1801,6 +1801,11 @@ int proc_get_namespace_targets(proc_signal_target_t *out,
 
 pid_t proc_namespace_host_pid(int64_t guest_pid)
 {
+    /* registry_collect reads a guest_filter of 0 as "every member", so a caller
+     * passing 0 or a negative pid would get an arbitrary one.
+     */
+    if (guest_pid <= 0)
+        return -1;
     proc_signal_target_t target;
     return registry_collect(&target, 1, PROC_PGID_ANY, guest_pid) > 0
                ? target.host_pid
