@@ -731,7 +731,7 @@ test-absock-cleanup: $(ELFUSE_BIN) $(BUILD_DIR)/test-absock-cleanup
 # pid to another elfuse process. The recipe plants such a record, host pid of
 # a live unrelated elfuse run with a start time it does not have, and the
 # family's kill(99, 0) must still fail with ESRCH.
-## registry ignores a record whose host pid was reused
+## registry ignores a reused host pid, and is not named after one
 test-registry-stale-pid: $(ELFUSE_BIN) $(BUILD_DIR)/test-registry-stale-pid
 	@tmp=$$(mktemp -d); xpid=; fpid=; \
 	trap 'kill $$xpid $$fpid 2>/dev/null; rm -rf "$$tmp"' EXIT; \
@@ -760,6 +760,10 @@ test-registry-stale-pid: $(ELFUSE_BIN) $(BUILD_DIR)/test-registry-stale-pid
 	[ "$$(printf '%s\n' "$$new" | grep -c .)" = 1 ] \
 	    || fail "expected one new registry in $$dir, saw '$$new'"; \
 	reg="$$dir$$new"; \
+	root=$$(pgrep -P "$$fpid" | head -1); \
+	[ -n "$$root" ] || fail "family root process not found"; \
+	[ "$$new" != "elfuse-procs-$$root" ] \
+	    || fail "family id is the root pid $$root, which macOS recycles"; \
 	holder=$$(pgrep -P "$$xpid" | head -1); \
 	[ -n "$$holder" ] || fail "holder elfuse process not found"; \
 	printf '%s 99 1 1\n' "$$holder" >> "$$reg" \

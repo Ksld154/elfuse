@@ -418,7 +418,7 @@ int64_t proc_alloc_pid(void)
     if (!process_pid_sequence_path(path, sizeof(path)))
         return -LINUX_EAGAIN;
 
-    if (absock_get_namespace_id() == (uint64_t) getpid() &&
+    if (absock_namespace_is_owner() &&
         !atomic_exchange_explicit(&owner_sequence_reset, true,
                                   memory_order_relaxed))
         unlink(path);
@@ -749,7 +749,7 @@ static int lifecycle_open_locked(char *path, size_t path_size)
     static _Atomic bool owner_reset_done;
     if (!lifecycle_registry_path(path, path_size))
         return -1;
-    if (absock_get_namespace_id() == (uint64_t) getpid() &&
+    if (absock_namespace_is_owner() &&
         !atomic_exchange_explicit(&owner_reset_done, true,
                                   memory_order_relaxed))
         unlink(path);
@@ -1150,7 +1150,7 @@ static void lifecycle_import_children(void)
 static void proc_registry_reset_if_owner(const char *path)
 {
     static _Atomic bool reset_done;
-    if (absock_get_namespace_id() != (uint64_t) getpid())
+    if (!absock_namespace_is_owner())
         return;
     if (atomic_exchange_explicit(&reset_done, true, memory_order_relaxed))
         return;
@@ -3170,11 +3170,11 @@ static void unlink_own_transport(void)
     /* The namespace owner cleans the registry, but only once no other live
      * member still needs it: if the owner exits while fork children survive,
      * deleting the file would blind their kill(-1)/kill(0)/kill(-pgid). A rare
-     * orphaned family that outlives its owner leaves the file for the next
-     * same-pid run's reset (proc_registry_reset_if_owner) or the OS temp-dir
-     * purge.
+     * orphaned family that outlives its owner leaves its file for the OS
+     * temp-dir purge; no later run can claim it, since the name carries a
+     * minted id rather than a recyclable pid.
      */
-    if (absock_get_namespace_id() != (uint64_t) getpid())
+    if (!absock_namespace_is_owner())
         return;
     if (!process_registry_path(path, sizeof(path)))
         return;
