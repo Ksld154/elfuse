@@ -33,7 +33,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-sysroot-dotdot test-sysroot-openat2-walk \
         test-sysroot-inotify-names test-sysroot-exec-names \
         test-sysroot-interp-fallback test-sysroot-interp-cased \
-        test-sysroot-absock-names test-absock-cleanup \
+        test-sysroot-absock-names test-absock-cleanup test-registry-stale-pid \
         test-linkat-symlink-fallback test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
         test-wakeup-pipe-host test-guest-env-host \
@@ -340,6 +340,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	$(call run-lane,test-sysroot-interp-cased,PT_INTERP through an escaped path)
 	$(call run-lane,test-sysroot-absock-names,pathname sockets across the escape boundary)
 	$(call run-lane,test-absock-cleanup,absock namespace lifecycle)
+	$(call run-lane,test-registry-stale-pid,stale registry record on a reused host pid)
 	$(call run-lane,test-sysroot-root,sysroot mounted at /)
 	$(call run-lane,test-nosysroot-literal-names,literal names without a sysroot)
 	$(call run-lane,test-sysroot-outside-names,literal names outside the sysroot)
@@ -725,6 +726,53 @@ test-absock-cleanup: $(ELFUSE_BIN) $(BUILD_DIR)/test-absock-cleanup
 		exit 1; \
 	fi; \
 	$(ASSERT_NO_ABSOCK_LEAK)
+
+# An exited member's registry record outlives it, and macOS can hand its host
+# pid to another elfuse process. The recipe plants such a record, host pid of
+# a live unrelated elfuse run with a start time it does not have, and the
+# family's kill(99, 0) must still fail with ESRCH.
+## registry ignores a record whose host pid was reused
+test-registry-stale-pid: $(ELFUSE_BIN) $(BUILD_DIR)/test-registry-stale-pid
+	@tmp=$$(mktemp -d); xpid=; fpid=; \
+	trap 'kill $$xpid $$fpid 2>/dev/null; rm -rf "$$tmp"' EXIT; \
+	fail() { printf "FAIL: %s\n" "$$1"; exit 1; }; \
+	printf "  %-30s " "stale record on reused pid"; \
+	tmo=$$(command -v timeout 2>/dev/null \
+	    || command -v gtimeout 2>/dev/null || true); \
+	[ -n "$$tmo" ] || { printf "SKIP (timeout(1) missing)\n"; exit 0; }; \
+	secs=$${TEST_TIMEOUT:-10}; \
+	dir=$$(getconf DARWIN_USER_TEMP_DIR); \
+	ls "$$dir" | grep '^elfuse-procs-' | sort > "$$tmp/before" || true; \
+	mkfifo "$$tmp/go"; \
+	$$tmo "$$secs" $(ELFUSE_BIN) $(BUILD_DIR)/test-registry-stale-pid hold & \
+	xpid=$$!; \
+	$$tmo "$$secs" $(ELFUSE_BIN) $(BUILD_DIR)/test-registry-stale-pid \
+	    < "$$tmp/go" > "$$tmp/out" & \
+	fpid=$$!; \
+	exec 4> "$$tmp/go"; \
+	for i in $$(seq 1 50); do \
+		grep -q READY "$$tmp/out" && break; \
+		sleep 0.1; \
+	done; \
+	grep -q READY "$$tmp/out" || fail "family never reported READY"; \
+	new=$$(ls "$$dir" | grep '^elfuse-procs-' | sort \
+	    | comm -13 "$$tmp/before" -); \
+	[ "$$(printf '%s\n' "$$new" | grep -c .)" = 1 ] \
+	    || fail "expected one new registry in $$dir, saw '$$new'"; \
+	reg="$$dir$$new"; \
+	holder=$$(pgrep -P "$$xpid" | head -1); \
+	[ -n "$$holder" ] || fail "holder elfuse process not found"; \
+	printf '%s 99 1 1\n' "$$holder" >> "$$reg" \
+	    || fail "cannot append to $$reg"; \
+	echo go >&4; \
+	exec 4>&-; \
+	wait $$fpid; \
+	rc=$$?; \
+	[ $$rc -eq 0 ] || fail "family exited rc=$$rc (124 means it hung)"; \
+	kill -0 "$$holder" 2>/dev/null || fail "holder exited before the lookup"; \
+	verdict=$$(sed -n 's/^STALE=//p' "$$tmp/out"); \
+	[ "$$verdict" = esrch ] || fail "kill(99, 0) $${verdict:-unreported}"; \
+	printf "OK\n"
 
 # PT_INTERP names the loader by the guest's spelling, and a rootfs may ship
 # it somewhere other than where the binary asks (store-style paths). The
