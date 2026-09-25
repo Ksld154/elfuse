@@ -2613,58 +2613,20 @@ static void zero_released_range(guest_t *g,
                                 uint64_t len,
                                 void *backing)
 {
-    size_t hps = host_page_size_cached();
     uint64_t end = start + len;
-    uint64_t host_start = ALIGN_DOWN(start, hps);
-    uint64_t host_end = ALIGN_UP(end, hps);
-    uint64_t cursor = start;
     uint8_t *dst = backing;
-    struct {
-        uint64_t start, end;
-    } overlays[GUEST_MAX_REGIONS];
-    int noverlays = 0;
 
-    /* Overlay metadata is attached to guest regions, but its host-page span
-     * can extend beyond the region. Collect the spans intersecting the
-     * released host pages, including a preceding region whose overlay reaches
-     * into this range. Region order keeps these spans sorted; merge fragments
-     * that refer to the same or overlapping host mapping.
-     */
-    int first = guest_region_first_end_above(g, host_start);
-    for (int i = first; i < g->nregions; i++) {
-        const guest_region_t *r = &g->regions[i];
-        if (r->start >= host_end)
-            break;
-        if (!region_has_live_overlay(r) || r->overlay_start >= host_end ||
-            r->overlay_end <= host_start)
-            continue;
-        if (noverlays > 0 && r->overlay_start <= overlays[noverlays - 1].end) {
-            if (r->overlay_end > overlays[noverlays - 1].end)
-                overlays[noverlays - 1].end = r->overlay_end;
-        } else if (noverlays < GUEST_MAX_REGIONS) {
-            overlays[noverlays].start = r->overlay_start;
-            overlays[noverlays].end = r->overlay_end;
-            noverlays++;
-        }
-    }
-
-    if (noverlays == 0) {
+    if (!live_overlay_conflict_end(g, start, end)) {
         memset(dst, 0, len);
         return;
     }
 
-    int overlay_idx = 0;
-
-    while (cursor < end) {
+    size_t hps = host_page_size_cached();
+    for (uint64_t cursor = start; cursor < end;) {
         uint64_t page_end = ALIGN_UP(cursor + 1, hps);
         if (page_end > end)
             page_end = end;
-        while (overlay_idx < noverlays && overlays[overlay_idx].end <= cursor)
-            overlay_idx++;
-        bool overlaid = overlay_idx < noverlays &&
-                        overlays[overlay_idx].start < page_end &&
-                        overlays[overlay_idx].end > cursor;
-        if (!overlaid)
+        if (!live_overlay_conflict_end(g, cursor, page_end))
             memset(dst + (cursor - start), 0, page_end - cursor);
         cursor = page_end;
     }
