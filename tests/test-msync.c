@@ -363,6 +363,218 @@ static void test_shared_guest_write_lands_in_file(void)
     close(fd);
 }
 
+static int make_partial_teardown_file(char *name, int *fd_out)
+{
+    int fd = mkstemp(name);
+    if (fd < 0)
+        return -1;
+    if ((ftruncate(fd, 16384) != 0) || (fd_out == NULL)) {
+        close(fd);
+        return -1;
+    }
+    *fd_out = fd;
+    for (int page = 0; page < 4; page++) {
+        unsigned char marker = (unsigned char) (0x31 + page);
+        if (pwrite(fd, &marker, 1, (off_t) (page * 4096)) != 1) {
+            close(fd);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void test_shared_partial_munmap_preserves_file_suffix(void)
+{
+    TEST("partial munmap preserves shared-file suffix");
+
+    char name[] = "/dev/shm/elfuse-msync-unmap-XXXXXX";
+    int fd = -1;
+    if (make_partial_teardown_file(name, &fd) != 0) {
+        FAIL("shared file setup failed");
+        return;
+    }
+    unlink(name);
+    unsigned char *p =
+        mmap(NULL, 16384, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) {
+        FAIL("shared mmap failed");
+        close(fd);
+        return;
+    }
+    if (munmap(p, 4096) != 0) {
+        FAIL("partial munmap failed");
+        munmap(p + 4096, 12288);
+        close(fd);
+        return;
+    }
+
+    bool ok = true;
+    for (int page = 1; page < 4; page++) {
+        if (p[page * 4096] != (unsigned char) (0x31 + page))
+            ok = false;
+    }
+    unsigned char source_byte = 0;
+    if ((pread(fd, &source_byte, 1, 0) != 1) || (source_byte != 0x31))
+        ok = false;
+    unsigned char update = 0x71;
+    if ((pwrite(fd, &update, 1, 8192) != 1) || (p[8192] != update))
+        ok = false;
+    p[12288] = 0x72;
+    unsigned char file_byte = 0;
+    if ((pread(fd, &file_byte, 1, 12288) != 1) || (file_byte != 0x72))
+        ok = false;
+    if (ok)
+        PASS();
+    else
+        FAIL("surviving MAP_SHARED suffix lost contents or coherence");
+    munmap(p + 4096, 12288);
+    close(fd);
+}
+
+static void test_shared_partial_munmap_hole_not_reused(void)
+{
+    TEST("partial munmap overlay hole is not reused");
+
+    char name[] = "/dev/shm/elfuse-msync-hole-XXXXXX";
+    int fd = -1;
+    if (make_partial_teardown_file(name, &fd) != 0) {
+        FAIL("shared file setup failed");
+        return;
+    }
+    unlink(name);
+    unsigned char *p =
+        mmap(NULL, 16384, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) {
+        FAIL("shared mmap failed");
+        close(fd);
+        return;
+    }
+    if (munmap(p, 4096) != 0) {
+        FAIL("partial munmap failed");
+        munmap(p + 4096, 12288);
+        close(fd);
+        return;
+    }
+
+    unsigned char *hole = mmap(p, 4096, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (hole == MAP_FAILED) {
+        FAIL("anonymous hole reuse mmap failed");
+        munmap(p + 4096, 12288);
+        close(fd);
+        return;
+    }
+    hole[0] = 0x7a;
+
+    unsigned char file_byte = 0;
+    bool ok = (hole != p) && (pread(fd, &file_byte, 1, 0) == 1) &&
+              (file_byte == 0x31);
+    for (int page = 1; page < 4; page++) {
+        if (p[page * 4096] != (unsigned char) (0x31 + page))
+            ok = false;
+    }
+    unsigned char update = 0x71;
+    if ((pwrite(fd, &update, 1, 8192) != 1) || (p[8192] != update))
+        ok = false;
+    if (ok)
+        PASS();
+    else
+        FAIL("hole reuse changed file or surviving MAP_SHARED suffix");
+    munmap(hole, 4096);
+    munmap(p + 4096, 12288);
+    close(fd);
+}
+
+static void test_shared_partial_mremap_preserves_file_suffix(void)
+{
+    TEST("partial mremap preserves shared-file suffix");
+
+    char name[] = "/dev/shm/elfuse-msync-mremap-XXXXXX";
+    int fd = -1;
+    if (make_partial_teardown_file(name, &fd) != 0) {
+        FAIL("shared file setup failed");
+        return;
+    }
+    unlink(name);
+    unsigned char *p =
+        mmap(NULL, 16384, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) {
+        FAIL("shared mmap failed");
+        close(fd);
+        return;
+    }
+    unsigned char *q = mremap(p, 4096, 8192, MREMAP_MAYMOVE);
+    if (q == MAP_FAILED) {
+        FAIL("partial mremap failed");
+        munmap(p, 16384);
+        close(fd);
+        return;
+    }
+
+    bool ok = (q != p) && (q[0] == 0x31) && (q[4096] == 0);
+    for (int page = 1; page < 4; page++) {
+        if (p[page * 4096] != (unsigned char) (0x31 + page))
+            ok = false;
+    }
+    unsigned char source_byte = 0;
+    if ((pread(fd, &source_byte, 1, 0) != 1) || (source_byte != 0x31))
+        ok = false;
+    unsigned char update = 0x71;
+    if ((pwrite(fd, &update, 1, 8192) != 1) || (p[8192] != update))
+        ok = false;
+    p[12288] = 0x72;
+    unsigned char file_byte = 0;
+    if ((pread(fd, &file_byte, 1, 12288) != 1) || (file_byte != 0x72))
+        ok = false;
+    if (ok)
+        PASS();
+    else
+        FAIL("mremap damaged source suffix or destination contents");
+    munmap(q, 8192);
+    munmap(p + 4096, 12288);
+    close(fd);
+}
+
+static void test_shared_mremap_shrink_preserves_file_tail(void)
+{
+    TEST("MAP_SHARED mremap shrink preserves file tail");
+
+    char name[] = "/dev/shm/elfuse-msync-shrink-XXXXXX";
+    int fd = -1;
+    if (make_partial_teardown_file(name, &fd) != 0) {
+        FAIL("shared file setup failed");
+        return;
+    }
+    unlink(name);
+    unsigned char *p =
+        mmap(NULL, 16384, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) {
+        FAIL("shared mmap failed");
+        close(fd);
+        return;
+    }
+    unsigned char *q = mremap(p, 16384, 12288, 0);
+    if (q == MAP_FAILED) {
+        FAIL("shared mremap shrink failed");
+        munmap(p, 16384);
+        close(fd);
+        return;
+    }
+
+    unsigned char tail = 0;
+    bool ok =
+        (q[0] == 0x31) && (pread(fd, &tail, 1, 12288) == 1) && (tail == 0x34);
+    unsigned char update = 0x71;
+    if ((pwrite(fd, &update, 1, 8192) != 1) || (q[8192] != update))
+        ok = false;
+    if (ok)
+        PASS();
+    else
+        FAIL("mremap shrink changed file tail or prefix coherence");
+    munmap(q, 12288);
+    close(fd);
+}
+
 /* On hosts with pages larger than the guest's 4 KiB granule, a MAP_SHARED
  * overlay of one guest page can alias adjacent guest pages in the same host
  * page. Replacing the adjacent guest page must tear down the shared overlay
@@ -603,6 +815,10 @@ int main(void)
     test_shared_msync_preserves_alias_writes();
     test_shared_host_write_visible_without_msync();
     test_shared_guest_write_lands_in_file();
+    test_shared_partial_munmap_preserves_file_suffix();
+    test_shared_partial_munmap_hole_not_reused();
+    test_shared_partial_mremap_preserves_file_suffix();
+    test_shared_mremap_shrink_preserves_file_tail();
     test_shared_adjacent_fixed_mapping_does_not_alias_file();
     test_shared_large_mapping_crosses_split_hvf_segments();
     test_shared_back_to_back_memfd_mappings();

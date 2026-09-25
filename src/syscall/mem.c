@@ -680,6 +680,32 @@ static void undo_region_splits(guest_t *g, const region_split_undo_t undo[2])
     undo_region_split(g, &undo[0]);
 }
 
+/* Return the end of a live host overlay overlapping [start, end), or zero
+ * when the candidate does not touch one. Region coverage is guest-granular;
+ * an overlay can extend into a gap by the rest of its host page, so gap
+ * placement must account for overlay spans as well as tracked regions.
+ */
+static uint64_t live_overlay_conflict_end(const guest_t *g,
+                                          uint64_t start,
+                                          uint64_t end)
+{
+    size_t hps = host_page_size_cached();
+    uint64_t host_start = ALIGN_DOWN(start, hps);
+    uint64_t host_end = ALIGN_UP(end, hps);
+    uint64_t conflict_end = 0;
+    int first = guest_region_first_end_above(g, host_start);
+
+    for (int i = first; i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (r->start >= host_end)
+            break;
+        if (region_has_live_overlay(r) && r->overlay_start < end &&
+            r->overlay_end > start && r->overlay_end > conflict_end)
+            conflict_end = r->overlay_end;
+    }
+    return conflict_end;
+}
+
 static uint64_t find_free_gap_inner(const guest_t *g,
                                     uint64_t length,
                                     uint64_t min_addr,
@@ -727,8 +753,19 @@ static uint64_t find_free_gap_inner(const guest_t *g,
          * valid range.
          */
         if (window_fits(gap_start, length, max_addr) &&
-            g->regions[i].start >= gap_start + length)
-            return gap_start;
+            g->regions[i].start >= gap_start + length) {
+            uint64_t conflict_end =
+                live_overlay_conflict_end(g, gap_start, gap_start + length);
+            if (!conflict_end)
+                return gap_start;
+            if (!align_up_ok(conflict_end, align, &gap_start))
+                return UINT64_MAX;
+            /* The skipped region may extend beyond the overlay span. Recheck
+             * it at the advanced candidate before moving on to later regions.
+             */
+            i--;
+            continue;
+        }
 
         /* Region overlaps; advance past it and round to the next aligned
          * boundary so the caller's alignment promise holds across allocations.
@@ -740,9 +777,17 @@ static uint64_t find_free_gap_inner(const guest_t *g,
             return UINT64_MAX;
     }
 
-    /* Check trailing space after all regions */
-    if (window_fits(gap_start, length, max_addr))
-        return gap_start;
+    /* Check trailing space after all regions, including rounded overlay tails
+     * that extend beyond the final guest region.
+     */
+    while (window_fits(gap_start, length, max_addr)) {
+        uint64_t conflict_end =
+            live_overlay_conflict_end(g, gap_start, gap_start + length);
+        if (!conflict_end)
+            return gap_start;
+        if (!align_up_ok(conflict_end, align, &gap_start))
+            return UINT64_MAX;
+    }
     return UINT64_MAX; /* No suitable gap found */
 }
 
@@ -2435,7 +2480,10 @@ static int hvf_remove_file_overlay(guest_t *g, uint64_t ipa, uint64_t len)
  * gone while the file mmap is still live (which would cause a later memset to
  * write into the file). Caller holds mmap_lock.
  */
-static int cleanup_overlays_in_range(guest_t *g, uint64_t start, uint64_t end)
+static int cleanup_overlays_in_range(guest_t *g,
+                                     uint64_t start,
+                                     uint64_t end,
+                                     bool preserve_survivors)
 {
     size_t hps = host_page_size_cached();
     uint64_t host_start = ALIGN_DOWN(start, hps);
@@ -2503,6 +2551,38 @@ static int cleanup_overlays_in_range(guest_t *g, uint64_t start, uint64_t end)
             n++;
         }
     }
+
+    /* A guest range can remove only part of a host page. Keep the MAP_SHARED
+     * mapping installed while any tracked part of that overlay survives: a
+     * host MAP_FIXED replacement here would detach the survivor from the file
+     * page cache and lose live coherence. Callers which install a different
+     * backing (notably MAP_FIXED) pass false because the host page must be
+     * detached to isolate the replacement.
+     */
+    if (preserve_survivors) {
+        int kept = 0;
+        for (int i = 0; i < n; i++) {
+            uint64_t ovl_start = overlays[i].off;
+            uint64_t ovl_end = ovl_start + overlays[i].len;
+            bool survives = false;
+            for (int j = guest_region_first_end_above(g, ovl_start);
+                 j < g->nregions; j++) {
+                const guest_region_t *r = &g->regions[j];
+                if (r->start >= ovl_end)
+                    break;
+                if (r->end <= ovl_start || !region_has_live_overlay(r) ||
+                    r->overlay_start != ovl_start || r->overlay_end != ovl_end)
+                    continue;
+                if (r->start < start || r->end > end) {
+                    survives = true;
+                    break;
+                }
+            }
+            if (!survives)
+                overlays[kept++] = overlays[i];
+        }
+        n = kept;
+    }
     int err = 0;
     for (int i = 0; i < n; i++) {
         int rc = hvf_remove_file_overlay(g, overlays[i].off, overlays[i].len);
@@ -2521,6 +2601,75 @@ static int cleanup_overlays_in_range(guest_t *g, uint64_t start, uint64_t end)
     return err;
 }
 
+/* Clear released backing without writing through a surviving MAP_SHARED host
+ * overlay. Host mappings cannot be split at the guest's 4 KiB granule, so a
+ * single overlaid host page must be left intact while any guest subpage in it
+ * remains mapped. The removed guest subpage is inaccessible until a later
+ * mapping replaces it; MAP_FIXED cleanup detaches the overlay before reusing
+ * that host page.
+ */
+static void zero_released_range(guest_t *g,
+                                uint64_t start,
+                                uint64_t len,
+                                void *backing)
+{
+    size_t hps = host_page_size_cached();
+    uint64_t end = start + len;
+    uint64_t host_start = ALIGN_DOWN(start, hps);
+    uint64_t host_end = ALIGN_UP(end, hps);
+    uint64_t cursor = start;
+    uint8_t *dst = backing;
+    struct {
+        uint64_t start, end;
+    } overlays[GUEST_MAX_REGIONS];
+    int noverlays = 0;
+
+    /* Overlay metadata is attached to guest regions, but its host-page span
+     * can extend beyond the region. Collect the spans intersecting the
+     * released host pages, including a preceding region whose overlay reaches
+     * into this range. Region order keeps these spans sorted; merge fragments
+     * that refer to the same or overlapping host mapping.
+     */
+    int first = guest_region_first_end_above(g, host_start);
+    for (int i = first; i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (r->start >= host_end)
+            break;
+        if (!region_has_live_overlay(r) || r->overlay_start >= host_end ||
+            r->overlay_end <= host_start)
+            continue;
+        if (noverlays > 0 && r->overlay_start <= overlays[noverlays - 1].end) {
+            if (r->overlay_end > overlays[noverlays - 1].end)
+                overlays[noverlays - 1].end = r->overlay_end;
+        } else if (noverlays < GUEST_MAX_REGIONS) {
+            overlays[noverlays].start = r->overlay_start;
+            overlays[noverlays].end = r->overlay_end;
+            noverlays++;
+        }
+    }
+
+    if (noverlays == 0) {
+        memset(dst, 0, len);
+        return;
+    }
+
+    int overlay_idx = 0;
+
+    while (cursor < end) {
+        uint64_t page_end = ALIGN_UP(cursor + 1, hps);
+        if (page_end > end)
+            page_end = end;
+        while (overlay_idx < noverlays && overlays[overlay_idx].end <= cursor)
+            overlay_idx++;
+        bool overlaid = overlay_idx < noverlays &&
+                        overlays[overlay_idx].start < page_end &&
+                        overlays[overlay_idx].end > cursor;
+        if (!overlaid)
+            memset(dst + (cursor - start), 0, page_end - cursor);
+        cursor = page_end;
+    }
+}
+
 int mmap_exec_drop_overlays(guest_t *g)
 {
     /* The whole primary window: an overlay only ever binds a host VA inside it
@@ -2529,7 +2678,7 @@ int mmap_exec_drop_overlays(guest_t *g)
      * boundaries fall outside the region array, so the splits are no-ops and
      * this cannot fail for want of a region slot.
      */
-    return cleanup_overlays_in_range(g, 0, g->guest_size);
+    return cleanup_overlays_in_range(g, 0, g->guest_size, false);
 }
 
 /* Memory syscalls (tightly coupled to guest.h). */
@@ -3061,8 +3210,8 @@ int64_t sys_mmap(guest_t *g,
              * leak into the new mapping. Must run before guest_region_remove
              * because the cleanup walker reads the live region metadata.
              */
-            int cleanup_err =
-                cleanup_overlays_in_range(g, result_off, result_off + length);
+            int cleanup_err = cleanup_overlays_in_range(
+                g, result_off, result_off + length, false);
             if (cleanup_err < 0) {
                 (void) restore_snapshot_overlays_in_place(
                     g, fresh.replaced_snaps, fresh.replaced_nsnaps);
@@ -3173,8 +3322,8 @@ int64_t sys_mmap(guest_t *g,
             /* Restore slab backing under any pre-existing MAP_SHARED file
              * overlay before dropping the region tracking.
              */
-            int cleanup_err =
-                cleanup_overlays_in_range(g, result_off, result_off + length);
+            int cleanup_err = cleanup_overlays_in_range(
+                g, result_off, result_off + length, false);
             if (cleanup_err < 0) {
                 (void) restore_snapshot_overlays_in_place(
                     g, fresh.replaced_snaps, fresh.replaced_nsnaps);
@@ -3717,10 +3866,11 @@ int64_t sys_mremap(guest_t *g,
                                         &tail_remove_fd) < 0)
             return finish_mremap(&source, -LINUX_ENOMEM);
 
-        /* Restore slab backing under any tail overlay before zeroing so the
-         * memset does not write zeros into a file.
+        /* Preserve a live host overlay when this removal leaves any of its
+         * guest pages mapped. The released bytes must then stay untouched.
          */
-        int cleanup_err = cleanup_overlays_in_range(g, tail_off, tail_end);
+        int cleanup_err =
+            cleanup_overlays_in_range(g, tail_off, tail_end, true);
         if (cleanup_err < 0) {
             if (tail_remove_fd >= 0)
                 close(tail_remove_fd);
@@ -3730,8 +3880,9 @@ int64_t sys_mremap(guest_t *g,
         /* Zero the trimmed region on its real backing (high-VA tails live at
          * gpa_base, not host_base + tail_off).
          */
-        memset(host_ptr_for_gpa(g, src_gpa_base + (tail_off - src_start)), 0,
-               tail_end - tail_off);
+        zero_released_range(
+            g, tail_off, tail_end - tail_off,
+            host_ptr_for_gpa(g, src_gpa_base + (tail_off - src_start)));
         guest_region_remove_reserved(g, tail_off, tail_end, tail_remove_fd);
         guest_invalidate_ptes(g, tail_off, tail_end);
         if (tail_off < g->mmap_rw_gap_hint)
@@ -3861,7 +4012,7 @@ int64_t sys_mremap(guest_t *g,
 
         if (source_overlay) {
             int cleanup_err =
-                cleanup_overlays_in_range(g, old_off, old_off + old_size);
+                cleanup_overlays_in_range(g, old_off, old_off + old_size, true);
             if (cleanup_err < 0) {
                 (void) restore_snapshot_overlays_in_place(g, move.source_snaps,
                                                           move.source_nsnaps);
@@ -3871,7 +4022,7 @@ int64_t sys_mremap(guest_t *g,
         }
 
         int cleanup_err =
-            cleanup_overlays_in_range(g, new_off, new_off + new_size);
+            cleanup_overlays_in_range(g, new_off, new_off + new_size, false);
         if (cleanup_err < 0) {
             int restore_err = restore_snapshot_overlays_in_place(
                 g, move.source_snaps, move.source_nsnaps);
@@ -3953,8 +4104,9 @@ int64_t sys_mremap(guest_t *g,
 
         /* Remove old mapping */
         if (old_size > 0) {
-            memset(host_ptr_for_gpa(g, src_gpa_base + (old_off - src_start)), 0,
-                   old_size);
+            zero_released_range(
+                g, old_off, old_size,
+                host_ptr_for_gpa(g, src_gpa_base + (old_off - src_start)));
             guest_region_remove_reserved(g, old_off, old_off + old_size,
                                          move.source_remove_fd);
             move.source_remove_fd = -1;
@@ -4105,7 +4257,7 @@ int64_t sys_mremap(guest_t *g,
 
         if (source_overlay) {
             int cleanup_err =
-                cleanup_overlays_in_range(g, old_off, old_off + old_size);
+                cleanup_overlays_in_range(g, old_off, old_off + old_size, true);
             if (cleanup_err < 0) {
                 int restore_err =
                     restore_mremap_source_overlays_in_place(g, &source);
@@ -4164,11 +4316,13 @@ int64_t sys_mremap(guest_t *g,
         memset((uint8_t *) g->host_base + new_off + old_size, 0,
                new_size - old_size);
 
-        /* Remove old mapping. Any live source overlay was already torn down
-         * before the destination range was touched.
+        /* Remove the old mapping. A source overlay that has no surviving
+         * guest pages was torn down above; an overlay retained for adjacent
+         * source pages remains mapped, and zero_released_range skips it.
          */
-        memset(host_ptr_for_gpa(g, src_gpa_base + (old_off - src_start)), 0,
-               old_size);
+        zero_released_range(
+            g, old_off, old_size,
+            host_ptr_for_gpa(g, src_gpa_base + (old_off - src_start)));
         guest_region_remove_reserved(g, old_off, old_off + old_size,
                                      source_remove_fd);
         guest_invalidate_ptes(g, old_off, old_off + old_size);
@@ -4412,11 +4566,11 @@ static int munmap_guest_range(guest_t *g, uint64_t unmap_off, uint64_t end)
     if (guest_region_remove_prepare(g, unmap_off, end, &remove_fd) < 0)
         return -LINUX_ENOMEM;
 
-    /* Restore slab backing under any active MAP_SHARED file overlay before
-     * zeroing the host VA. Without this, the memset below would write zeros
-     * directly into the file.
+    /* Keep an overlay live when this removal leaves mapped guest pages sharing
+     * its host page. zero_released_range skips those host pages so the removed
+     * subrange cannot write zeros through the shared file mapping.
      */
-    int cleanup_err = cleanup_overlays_in_range(g, unmap_off, end);
+    int cleanup_err = cleanup_overlays_in_range(g, unmap_off, end, true);
     if (cleanup_err < 0) {
         if (remove_fd >= 0)
             close(remove_fd);
@@ -4443,7 +4597,8 @@ static int munmap_guest_range(guest_t *g, uint64_t unmap_off, uint64_t end)
             continue;
         uint64_t zstart = (r->start > unmap_off) ? r->start : unmap_off;
         uint64_t zend = (r->end < end) ? r->end : end;
-        memset((uint8_t *) g->host_base + zstart, 0, zend - zstart);
+        zero_released_range(g, zstart, zend - zstart,
+                            (uint8_t *) g->host_base + zstart);
     }
     guest_region_remove_reserved(g, unmap_off, end, remove_fd);
     if (unmap_off < g->mmap_rw_gap_hint)
