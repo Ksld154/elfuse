@@ -362,6 +362,12 @@ thread_entry_t *thread_find_locked(int64_t tid);
  */
 bool thread_tid_alive(int64_t tid);
 
+/* Is there an active thread with this TID that is not a VM-clone child? Takes
+ * thread_lock, because is_vm_clone is one of the fields thread_alloc clears
+ * with a plain memset.
+ */
+bool thread_tid_in_group(int64_t tid);
+
 /* Count currently active threads. */
 int thread_active_count(void);
 

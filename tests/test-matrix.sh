@@ -299,6 +299,7 @@ QEMU_SKIP="
     test-mremap-tail-emfile
     test-credentials
     test-credentials-fakeroot
+    test-proc-limits-fakeroot
     test-fakeroot-exec
     test-setuid-exec
     test-setuid-exec-fakeroot
@@ -361,6 +362,8 @@ QEMU_SKIP="
 # test-credentials: pins elfuse's restricted "fakeroot" setuid/capset/
 #   getgroups model (deliberately narrower than real root); the qemu
 #   reference lane runs as genuine root, which has unrestricted privilege.
+# test-proc-limits-fakeroot: the root half of test-proc-limits; the qemu lane
+#   already runs test-proc-limits itself as root.
 # test-fakeroot-exec: ELFUSE_FAKEROOT_EXEC is an elfuse-only escape hatch --
 #   a real kernel has no notion of an executable that turns on fakeroot, so
 #   the marked exec simply stays unprivileged there.
@@ -825,6 +828,8 @@ run_unit_tests()
     test_rc "$runner" "test-procfs" 0 "$bindir/test-procfs"
     test_rc "$runner" "test-procfs-exec" 0 "$bindir/test-procfs-exec"
     test_rc "$runner" "test-proc-limits" 0 "$bindir/test-proc-limits"
+    test_rc "$runner" "test-proc-limits-fakeroot" 0 --fakeroot \
+        "$bindir/test-proc-limits"
     test_rc "$runner" "test-proc-fidelity" 0 "$bindir/test-proc-fidelity"
     test_rc "$runner" "test-proc-smap" 0 "$bindir/test-proc-smap"
 

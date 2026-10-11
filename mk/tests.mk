@@ -24,7 +24,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-dynamic-array-host test-string-builder-host test-gdbstub-host \
         test-config test-runner \
         test-mremap-tail-emfile \
-        test-proctitle-host test-proctitle-low-stack \
+        test-proctitle-host test-proctitle-low-stack test-rlimit-seed \
         test-sysroot-procfs-exec test-sysroot-fd-magiclink \
         test-timeout-disable test-launch-flags \
         test-fuse-alpine \
@@ -327,6 +327,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	$(call run-lane,test-gva-contracts,proved/gva.h call-site contract checks)
 	$(call run-lane,test-proctitle-host,proctitle argv-tail regression)
 	$(call run-lane,test-proctitle-low-stack,proctitle low-stack regression)
+	$(call run-lane,test-rlimit-seed,guest rlimits seeded from host limits)
 	$(call run-lane,test-busybox,busybox applet validation)
 	$(call run-lane,test-sysroot-procfs-exec,sysroot procfs exec validation)
 	$(call run-lane,test-sysroot-fd-magiclink,fd magic link resolution)
@@ -1487,6 +1488,15 @@ test-proctitle-low-stack: $(ELFUSE_BIN) $(BUSYBOX_DEPS)
 		exit 1; \
 	fi
 	@bash tests/test-proctitle-low-stack.sh $(ELFUSE_BIN) $(BUSYBOX_BIN)
+
+## Check guest rlimits seeded from host limits a shell set
+test-rlimit-seed: $(ELFUSE_BIN) $(BUSYBOX_DEPS) $(TEST_DIR)/test-proc-limits
+	@if [ ! -x "$(BUSYBOX_BIN)" ]; then \
+		printf "$(RED)✗ Busybox not found.$(RESET) Set BUSYBOX_BIN=/path/to/busybox.\n"; \
+		exit 1; \
+	fi
+	@bash tests/test-rlimit-seed.sh $(ELFUSE_BIN) $(BUSYBOX_BIN) \
+		$(TEST_DIR)/test-proc-limits
 
 # Static binary integration tests
 ifdef GUEST_STATIC_BINS

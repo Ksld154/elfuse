@@ -497,6 +497,21 @@ bool thread_tid_alive(int64_t tid)
     return false;
 }
 
+bool thread_tid_in_group(int64_t tid)
+{
+    bool found = false;
+    pthread_mutex_lock(&thread_lock);
+    THREAD_FOR_EACH (t) {
+        if (atomic_load_explicit(&t->active, memory_order_relaxed) &&
+            thread_tid(t) == tid && !t->is_vm_clone) {
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&thread_lock);
+    return found;
+}
+
 int thread_active_count(void)
 {
     return atomic_load_explicit(&active_thread_count, memory_order_relaxed);
