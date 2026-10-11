@@ -200,14 +200,21 @@ _Static_assert(THREAD_SLOT_KEPT(tpending.pending),
                "tpending.pending is cleared by the memset");
 _Static_assert(THREAD_SLOT_KEPT(in_syscall),
                "in_syscall is cleared by the memset");
+_Static_assert(THREAD_SLOT_KEPT(futex_park_lock),
+               "futex_park_lock is cleared by the memset");
+_Static_assert(THREAD_SLOT_KEPT(futex_park_cond),
+               "futex_park_cond is cleared by the memset");
+_Static_assert(THREAD_SLOT_KEPT(futex_kick),
+               "futex_kick is cleared by the memset");
 
 /* Clear a slot that thread_alloc is about to hand to a new thread.
  *
- * A whole-struct memset cannot be used. Three scans walk the table lock-free
- * and each loads active and then a payload field with no lock in between, so
- * one of them can still be reading this slot after it went inactive and while
- * the recycle runs. Plain-writing any field they read is a data race, so the
- * five they touch are stored atomically and the memset skips them.
+ * A whole-struct memset cannot be used. The scans that walk the table lock-free
+ * each load active and then a payload field with no lock in between, so one of
+ * them can still be reading this slot after it went inactive and while the
+ * recycle runs. Plain-writing any field they read is a data race, so the memset
+ * skips them all: five are stored atomically here, and the futex park fields
+ * are left as the last owner cleared them (runtime/thread.h).
  */
 static void thread_slot_clear(thread_entry_t *t)
 {
@@ -648,9 +655,9 @@ static void thread_join_workers_mode(bool exec_mode)
      * re-check latency of every such state or a worker that WOULD wind down
      * cleanly gets abandoned on timing alone: the interruptible io wait
      * re-checks every 200ms (io.c wait helper) and the futex paths every 100ms
-     * (FUTEX_OS_SYNC_POLL_CAP_NS quanta), so 500ms covers the slowest bound
-     * with margin. One shared deadline keeps worst-case shutdown at the cap
-     * even with many stuck workers, rather than multiplying a per-worker cap by
+     * (FUTEX_POLL_QUANTUM_NS quanta), so 500ms covers the slowest bound with
+     * margin. One shared deadline keeps worst-case shutdown at the cap even
+     * with many stuck workers, rather than multiplying a per-worker cap by
      * nworkers. A worker still alive past the cap is detached and, if this pass
      * claimed its handle, marked join_abandoned so a later pass does not touch
      * it again. The vCPU is NOT destroyed here because HVF vCPUs are
@@ -851,6 +858,20 @@ bool thread_signal_deliverable(uint64_t sigbit)
             return true;
     }
     return false;
+}
+
+void thread_kick_futex_waiters(uint64_t shared_pending)
+{
+    /* Lock-free scan, on the same terms as thread_signal_deliverable above. A
+     * stale blocked or pending read costs a kick the thread answers by parking
+     * again, or misses one its own polling quantum still covers. The caller is
+     * skipped: it tests its own pending signals on the way out.
+     */
+    THREAD_FOR_EACH_ACTIVE_RELAXED (t) {
+        uint64_t pending = pending_load(&t->tpending.pending) | shared_pending;
+        if (t != current_thread && (pending & ~thread_blocked_load(t)))
+            futex_kick(t);
+    }
 }
 
 /* Fork quiesce. */
