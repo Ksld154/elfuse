@@ -665,6 +665,16 @@ in must be gated on an environment variable naming the device and must skip
 with a stated reason when it is absent -- a skip is not a pass, and the
 skip lists above are the model: deliberate, explained, and checked.
 
+## Host Rlimits
+
+Guest rlimits are guest state, but elfuse seeds them from its own host limits at
+boot, and no other process can read the rlimits of an elfuse process.
+`ELFUSE_HOST_RLIMIT_CHECK` makes each elfuse process record its host limits at
+start and, when one has moved by exit, write a line to stderr and exit 86.
+`test-rlimit-unchanged-host` runs `test-proc-limits` under it.
+`test-rlimit-seed` goes the other way: it sets host limits with `ulimit` before
+elfuse starts and reads what the guest's `/proc/self/limits` shows.
+
 ## Validation Strategy By Change Type
 
 Suggested minimum validation:
