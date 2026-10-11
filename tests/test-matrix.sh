@@ -826,7 +826,8 @@ run_unit_tests()
     test_check "$runner" "test-pthread" "0 failed" "$bindir/test-pthread"
     test_check "$runner" "test-cntvct-thread" "0 failed" \
         "$bindir/test-cntvct-thread"
-    test_check "$runner" "test-osync-requeue" "0 failed" "$bindir/test-osync-requeue"
+    test_check "$runner" "test-futex-requeue-latency" "0 failed" \
+        "$bindir/test-futex-requeue-latency"
     test_check "$runner" "test-futex-requeue-race" "0 failed" \
         "$bindir/test-futex-requeue-race"
     test_check "$runner" "test-simd-clone" "0 failed" "$bindir/test-simd-clone"

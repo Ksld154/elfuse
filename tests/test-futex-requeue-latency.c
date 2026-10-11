@@ -4,13 +4,13 @@
  * musl's private condvar (pthread_cond_timedwait.c: lock()/unlock_requeue())
  * parks waiters with a plain FUTEX_WAIT on a per-node "barrier" word, then its
  * broadcast/handoff path uses FUTEX_REQUEUE to move those parked waiters from
- * the barrier word onto the mutex word. Plain FUTEX_WAIT once parked on a
- * Darwin address-wait queue that FUTEX_REQUEUE could not walk, and a requeue
- * that reaches nobody strands the waiter until its 100 ms polling quantum ends.
+ * the barrier word onto the mutex word. If a plain FUTEX_WAIT waiter is parked
+ * on a queue that FUTEX_REQUEUE does not walk, the requeue cannot reach it, and
+ * it stays stranded until its 100 ms polling quantum ends.
  *
  * This reproduces the pattern with raw syscalls (libc-agnostic) and measures
- * the wake latency. A correct requeue path wakes the waiter in well under the
- * poll cap; a stranded waiter only surfaces after ~100 ms.
+ * the wake latency. A correct requeue path wakes the waiter in well under that
+ * quantum; a stranded waiter only surfaces after ~100 ms.
  */
 
 #include <errno.h>
@@ -61,14 +61,14 @@ int main(void)
     pthread_t th;
     if (pthread_create(&th, NULL, waiter_fn, NULL) != 0) {
         printf(
-            "test-osync-requeue: 0 passed, 1 failed - FAIL "
+            "test-futex-requeue-latency: 0 passed, 1 failed - FAIL "
             "(pthread_create)\n");
         return 1;
     }
 
     /* Let the waiter reach FUTEX_WAIT. Keep this well below the difference
-     * between the 100 ms polling quantum (FUTEX_OS_SYNC_POLL_CAP_NS) and the
-     * pass threshold below, so a stranded waiter surfaces near the quantum, far
+     * between the 100 ms polling quantum (FUTEX_POLL_QUANTUM_NS) and the pass
+     * threshold below, so a stranded waiter surfaces near the quantum, far
      * above the threshold, instead of landing on it.
      */
     usleep(10 * 1000);
@@ -89,7 +89,7 @@ int main(void)
     pthread_join(th, NULL);
     double latency = ms_since(&t0, &t_wake);
 
-    printf("test-osync-requeue: musl-style requeue wake latency\n");
+    printf("test-futex-requeue-latency: musl-style requeue wake latency\n");
     printf("  requeue rc=%d wake rc=%d\n", rq, wk);
     printf("  wake latency: %.2f ms\n", latency);
 
@@ -102,7 +102,7 @@ int main(void)
      */
     int reached = (rq > 0) || (wk > 0);
     int pass = reached && latency < 50.0;
-    printf("test-osync-requeue: %d passed, %d failed - %s\n", pass, !pass,
-           pass ? "PASS" : "FAIL");
+    printf("test-futex-requeue-latency: %d passed, %d failed - %s\n", pass,
+           !pass, pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

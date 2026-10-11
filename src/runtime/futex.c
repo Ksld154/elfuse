@@ -106,7 +106,7 @@ _Static_assert(FUTEX_WAKE_BITSET == 10,
  * multi-threaded runtimes, but that broke POSIX sem_wait callers that do not
  * retry on EINTR (e.g. foot's render worker).
  */
-#define FUTEX_OS_SYNC_POLL_CAP_NS (100ULL * 1000 * 1000)
+#define FUTEX_POLL_QUANTUM_NS (100ULL * 1000 * 1000)
 
 /* Hash table.
  *
@@ -726,7 +726,7 @@ static uint64_t futex_remaining_ns(const struct timespec *deadline,
 }
 
 /* Absolute CLOCK_REALTIME wait target one bounded quantum from now: the guest
- * deadline capped at FUTEX_OS_SYNC_POLL_CAP_NS. Every condvar sleep in the
+ * deadline capped at FUTEX_POLL_QUANTUM_NS. Every condvar sleep in the
  * timed-wait paths goes through this so a waiter parked on a distant guest
  * deadline still re-checks the process-wide teardown flags
  * (proc_exit_group_requested / futex_interrupt) each quantum; an uncapped sleep
@@ -748,7 +748,7 @@ static bool futex_quantum_deadline(const struct timespec *deadline,
 {
     int64_t now_ns = 0;
     uint64_t rem_ns =
-        futex_remaining_ns(deadline, FUTEX_OS_SYNC_POLL_CAP_NS, &now_ns);
+        futex_remaining_ns(deadline, FUTEX_POLL_QUANTUM_NS, &now_ns);
     if (rem_ns == 0)
         return false;
 
@@ -768,8 +768,8 @@ static bool futex_quantum_deadline(const struct timespec *deadline,
      * INT64_MAX casts to a negative add, and INT64_MAX - add then overflows.
      * Clamping in the unsigned domain keeps the comparison well defined.
      */
-    uint64_t bounded = rem_ns > (uint64_t) FUTEX_OS_SYNC_POLL_CAP_NS
-                           ? (uint64_t) FUTEX_OS_SYNC_POLL_CAP_NS
+    uint64_t bounded = rem_ns > (uint64_t) FUTEX_POLL_QUANTUM_NS
+                           ? (uint64_t) FUTEX_POLL_QUANTUM_NS
                            : rem_ns;
     int64_t add = (int64_t) bounded;
     int64_t at_ns = now_ns > INT64_MAX - add ? INT64_MAX : now_ns + add;
@@ -823,7 +823,7 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
      * before it.
      */
     if (!has_timeout ||
-        futex_remaining_ns(&deadline, FUTEX_OS_SYNC_POLL_CAP_NS, NULL) > 0) {
+        futex_remaining_ns(&deadline, FUTEX_POLL_QUANTUM_NS, NULL) > 0) {
         const uint32_t *spin_word = (const uint32_t *) guest_ptr(g, uaddr);
         if (spin_word && futex_spin_word_moved(spin_word, expected))
             return -LINUX_EAGAIN;

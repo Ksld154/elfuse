@@ -655,9 +655,9 @@ static void thread_join_workers_mode(bool exec_mode)
      * re-check latency of every such state or a worker that WOULD wind down
      * cleanly gets abandoned on timing alone: the interruptible io wait
      * re-checks every 200ms (io.c wait helper) and the futex paths every 100ms
-     * (FUTEX_OS_SYNC_POLL_CAP_NS quanta), so 500ms covers the slowest bound
-     * with margin. One shared deadline keeps worst-case shutdown at the cap
-     * even with many stuck workers, rather than multiplying a per-worker cap by
+     * (FUTEX_POLL_QUANTUM_NS quanta), so 500ms covers the slowest bound with
+     * margin. One shared deadline keeps worst-case shutdown at the cap even
+     * with many stuck workers, rather than multiplying a per-worker cap by
      * nworkers. A worker still alive past the cap is detached and, if this pass
      * claimed its handle, marked join_abandoned so a later pass does not touch
      * it again. The vCPU is NOT destroyed here because HVF vCPUs are
