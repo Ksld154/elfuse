@@ -290,7 +290,7 @@ static int pidfd_install(int fixed_fd,
      * pidfd's pipe cannot block, so the probe the alias path skips would have
      * decided nothing.
      */
-    fd_alias_spec_t spec = fd_alias_identity(ofd_id, 0);
+    fd_alias_spec_t spec = fd_alias_identity(ofd_id, LINUX_O_CLOEXEC);
     int gfd = fixed_fd >= 0
                   ? fd_alloc_alias_at(&spec, fixed_fd, FD_PIDFD, pfd[0],
                                       pidfd_cleanup, NULL)

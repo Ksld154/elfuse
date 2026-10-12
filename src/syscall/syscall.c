@@ -2309,7 +2309,7 @@ static int64_t sc_clone(guest_t *g,
         (unsigned long long) x0, (unsigned long long) x1,
         (unsigned long long) x2, (unsigned long long) x3,
         (unsigned long long) x4);
-    return sys_clone(current_thread->vcpu, g, x0, x1, 0, 0, x2, x3, x4,
+    return sys_clone(current_thread->vcpu, g, x0, x1, 0, 0, x2, x2, x3, x4,
                      verbose);
 }
 
