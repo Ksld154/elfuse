@@ -400,6 +400,11 @@ $(BUILD_DIR)/%: tests/%.c | $(BUILD_DIR)
 	@echo "  CROSS   $<"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $<
 
+# Static glibc timer functions need librt and its pthread dependency.
+$(BUILD_DIR)/test-posix-timers: tests/test-posix-timers.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lrt -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lrt -lpthread
+
 # test-usbdev-ioctl-departed reads the generated vectors out of build/, so it
 # needs that directory on the include path where the other guest binaries do
 # not.
