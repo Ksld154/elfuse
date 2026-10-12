@@ -623,6 +623,15 @@ static int translate_rlimit_resource(int linux_res)
     }
 }
 
+/* MAXSSIZ on arm64 macOS: 64 MiB less one 16 KiB page. */
+#define HOST_STACK_HARD_CAP (64ULL * 1024 * 1024 - 16 * 1024)
+
+/* _STK_LIM, the stack limit Linux starts a process with. macOS starts one at a
+ * 16 KiB page less.
+ */
+#define LINUX_STACK_DEFAULT (8ULL * 1024 * 1024)
+#define HOST_STACK_DEFAULT (LINUX_STACK_DEFAULT - 16 * 1024)
+
 static linux_rlimit64_t translate_host_rlimit(int resource, struct rlimit rl)
 {
     linux_rlimit64_t lim = {0};
@@ -632,15 +641,20 @@ static linux_rlimit64_t translate_host_rlimit(int resource, struct rlimit rl)
     lim.rlim_max =
         (rl.rlim_max == RLIM_INFINITY) ? LINUX_RLIM_INFINITY : rl.rlim_max;
 
-    /* macOS returns ~8MiB-16KiB for the default stack; round to Linux's
-     * conventional 8MiB to keep guest userspace behavior stable.
+    /* The macOS default stack limit reads as the Linux one. A limit the user
+     * set, and a default the hard limit has no room to round, pass through.
      */
-    if (resource == LINUX_RLIMIT_STACK && lim.rlim_cur > 0 &&
-        lim.rlim_cur < 8388608) {
-        lim.rlim_cur = 8388608;
-        if (lim.rlim_max < lim.rlim_cur)
-            lim.rlim_max = lim.rlim_cur;
-    }
+    if (resource == LINUX_RLIMIT_STACK && lim.rlim_cur == HOST_STACK_DEFAULT &&
+        lim.rlim_max >= LINUX_STACK_DEFAULT)
+        lim.rlim_cur = LINUX_STACK_DEFAULT;
+
+    /* macOS also caps the hard stack limit, at MAXSSIZ, where Linux starts a
+     * process with it unlimited. The cap is about host thread stacks and bounds
+     * nothing in the guest, so a host that sits at it reads as unlimited; one
+     * whose user lowered it keeps the lower value.
+     */
+    if (resource == LINUX_RLIMIT_STACK && lim.rlim_max >= HOST_STACK_HARD_CAP)
+        lim.rlim_max = LINUX_RLIM_INFINITY;
 
     return lim;
 }

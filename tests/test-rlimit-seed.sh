@@ -54,6 +54,15 @@ expect_row "RSS ignores a host AS limit" "-v $AS_KIB" "Max resident set" \
 expect_row "AS follows the host AS limit" "-v $AS_KIB" "Max address space" \
     "$((AS_KIB * 1024)) $((AS_KIB * 1024))"
 
+# 8176 KiB is the macOS default. make raises the soft limit to the hard one for
+# its children, so each case sets the soft limit itself.
+expect_row "the macOS default stack reads as 8 MiB" "-Ss 8176" \
+    "Max stack size" "8388608 unlimited"
+expect_row "a lowered soft stack limit passes through" "-Ss 2048" \
+    "Max stack size" "2097152 unlimited"
+expect_row "a lowered hard stack limit passes through" "-s 4096" \
+    "Max stack size" "4194304 4194304"
+
 if bash -c "ulimit -v $AS_KIB && exec \"\$0\" \"\$1\"" \
     "$ELFUSE" "$PROC_LIMITS" > /dev/null 2>&1; then
     report_pass "test-proc-limits under a host AS limit"
