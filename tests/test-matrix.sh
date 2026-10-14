@@ -817,6 +817,8 @@ run_unit_tests()
 
     printf "\nNetwork\n"
     test_check "$runner" "test-net" "0 failed" "$bindir/test-net"
+    test_check "$runner" "test-listen-backlog" "0 failed" \
+        "$bindir/test-listen-backlog"
     test_rc "$runner" "test-netstat" 0 "$bindir/test-netstat"
     test_rc "$runner" "test-netlink" 0 "$bindir/test-netlink"
     test_rc "$runner" "test-uevent-socket" 0 "$bindir/test-uevent-socket"
