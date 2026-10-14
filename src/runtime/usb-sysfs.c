@@ -93,8 +93,9 @@ static char usb_sys_dir[64]; /* scratch root == /sys */
  * spelling, or /tmp -> /private/tmp alone would fail it.
  */
 static char usb_sys_real[PATH_MAX];
-static char usb_dev_dir[64]; /* scratch root == /dev/bus     */
-static usb_dev_t *usb_devs;  /* grown on demand; see USB_DEVS_INIT_CAP */
+static char usb_dev_dir[64];        /* scratch root == /dev/bus     */
+static char usb_dev_real[PATH_MAX]; /* usb_dev_dir resolved, likewise */
+static usb_dev_t *usb_devs;         /* grown on demand; see USB_DEVS_INIT_CAP */
 static int usb_ndevs;
 static int usb_devs_cap;
 static pid_t usb_owner_pid;
@@ -1057,6 +1058,15 @@ static int ensure_usb_tree(void)
         usb_sys_dir[0] = usb_dev_dir[0] = usb_sys_real[0] = '\0';
         return -1;
     }
+    if (!realpath(usb_dev_dir, usb_dev_real)) {
+        int saved = errno;
+        usb_remove_tree(usb_sys_dir, 0);
+        usb_remove_tree(usb_dev_dir, 0);
+        usb_sys_dir[0] = usb_dev_dir[0] = usb_sys_real[0] = usb_dev_real[0] =
+            '\0';
+        errno = saved;
+        return -1;
+    }
 
     model_build();
 
@@ -1108,7 +1118,7 @@ fail:;
     int saved = errno;
     usb_remove_tree(usb_sys_dir, 0);
     usb_remove_tree(usb_dev_dir, 0);
-    usb_sys_dir[0] = usb_dev_dir[0] = usb_sys_real[0] = '\0';
+    usb_sys_dir[0] = usb_dev_dir[0] = usb_sys_real[0] = usb_dev_real[0] = '\0';
     model_release();
     errno = saved;
     return -1;
@@ -1551,6 +1561,18 @@ static usb_path_kind_t classify_and_normalize(const char *path,
     return USB_PATH_SYS;
 }
 
+static bool usb_root_contains(const char *root, const char *canonical)
+{
+    size_t rootlen = strlen(root);
+    return rootlen != 0 && !strncmp(canonical, root, rootlen) &&
+           (canonical[rootlen] == '\0' || canonical[rootlen] == '/');
+}
+
+static bool usb_sys_contained(const char *canonical)
+{
+    return usb_root_contains(usb_sys_real, canonical);
+}
+
 /* Resolve a host path inside the sysfs scratch tree and prove the result is
  * still inside it, so the caller can open it with symlinks followed.
  *
@@ -1572,13 +1594,6 @@ static usb_path_kind_t classify_and_normalize(const char *path,
  * Returns 0 with `out` filled, or -1 with errno set (realpath's errno, or
  * ENOENT for a path that resolved outside the tree).
  */
-static bool usb_sys_contained(const char *canonical)
-{
-    size_t rootlen = strlen(usb_sys_real);
-    return rootlen != 0 && !strncmp(canonical, usb_sys_real, rootlen) &&
-           (canonical[rootlen] == '\0' || canonical[rootlen] == '/');
-}
-
 static int usb_sys_resolve(const char *host_path, char *out, size_t outsz)
 {
     char resolved[PATH_MAX];
@@ -1780,12 +1795,20 @@ int usb_sysfs_guest_path_for_fd(int host_fd, char *out, size_t outsz)
 
     pthread_mutex_lock(&usb_lock);
     int rc = 0;
-    if (usb_sys_real[0] && usb_sys_contained(host_path)) {
-        /* usb_sys_contained proved the remainder after the root is either empty
-         * or starts with '/', so "/sys" plus it is the guest spelling.
-         */
-        const char *rel = host_path + strlen(usb_sys_real);
-        int n = snprintf(out, outsz, "/sys%s", rel);
+
+    /* Containment proved the remainder after the root is either empty or starts
+     * with '/', so the guest root plus it is the guest spelling.
+     */
+    const char *root = NULL, *guest = NULL;
+    if (usb_root_contains(usb_sys_real, host_path)) {
+        root = usb_sys_real;
+        guest = "/sys";
+    } else if (usb_root_contains(usb_dev_real, host_path)) {
+        root = usb_dev_real;
+        guest = "/dev/bus";
+    }
+    if (root) {
+        int n = snprintf(out, outsz, "%s%s", guest, host_path + strlen(root));
         rc = (n > 0 && (size_t) n < outsz) ? 1 : 0;
     }
     pthread_mutex_unlock(&usb_lock);

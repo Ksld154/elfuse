@@ -22,6 +22,9 @@
  * reachable: followed on a plain open, ELOOP only when the caller asked for
  * O_NOFOLLOW, and readable as a target either way.
  *
+ * The /dev/bus name checks at the end use the fixture's devices, which the lane
+ * always provides.
+ *
  * A run with no devices is not a pass by default: the device count is printed,
  * so a lane that quietly stopped covering the second half is visible rather
  * than merely green.
@@ -1147,6 +1150,40 @@ static int check_devices(void)
     return ndev;
 }
 
+/* Whether /proc/self/fd/@fd reads back as @want. */
+static bool fd_names(int fd, const char *want)
+{
+    char link[32], buf[128];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, buf, sizeof(buf) - 1);
+    if (n < 0)
+        return false;
+    buf[n] = '\0';
+    return !strcmp(buf, want);
+}
+
+/* A /dev/bus directory reached through '..' is named by the directory in getcwd
+ * and in /proc/self/fd, as Linux names it, not by the spelling.
+ */
+static void check_dev_bus_names(void)
+{
+    char cwd[64];
+
+    TEST("getcwd after chdir /dev/bus/usb/001/.. is /dev/bus/usb");
+    EXPECT_TRUE(chdir("/dev/bus/usb/001/..") == 0 && getcwd(cwd, sizeof(cwd)) &&
+                    !strcmp(cwd, "/dev/bus/usb"),
+                "chdir(\"/dev/bus/usb/001/..\"), then getcwd");
+    if (chdir("/") != 0)
+        FAIL("chdir back to /");
+
+    TEST("/dev/bus/usb/001/../001/ opens as /dev/bus/usb/001");
+    int fd = open("/dev/bus/usb/001/../001/", O_RDONLY | O_DIRECTORY);
+    EXPECT_TRUE(fd >= 0 && fd_names(fd, "/dev/bus/usb/001"),
+                "readlink of the descriptor");
+    if (fd >= 0)
+        close(fd);
+}
+
 int main(void)
 {
     printf("test-usb-sysfs: synthetic USB tree contract\n");
@@ -1154,6 +1191,7 @@ int main(void)
     check_tree_contract();
     check_slurp_reads_whole_files();
     int ndev = check_devices();
+    check_dev_bus_names();
 
     /* Stated, not implied: the second half is only as strong as the bus it ran
      * against, and a zero here means those assertions did not execute.

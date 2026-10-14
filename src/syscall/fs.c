@@ -963,12 +963,14 @@ int64_t sys_openat_path(guest_t *g,
              * walk off such a descriptor restart from the link's own directory
              * instead. Ask the descriptor what it holds; it names the link
              * itself for the O_PATH|O_NOFOLLOW open that asked for the link,
-             * and the target for every open that followed one.
+             * and the target for every open that followed one. Under /dev/bus
+             * the request may spell a '..' the layer applied, and the
+             * descriptor names the directory it reached.
              */
-            char sys_stamp[LINUX_PATH_MAX];
-            if (usb_sysfs_guest_path_for_fd(intercepted, sys_stamp,
-                                            sizeof(sys_stamp)) > 0)
-                stamp = sys_stamp;
+            char usb_stamp[LINUX_PATH_MAX];
+            if (usb_sysfs_guest_path_for_fd(intercepted, usb_stamp,
+                                            sizeof(usb_stamp)) > 0)
+                stamp = usb_stamp;
 
             if (alias_fd >= 0)
                 stamp = (aliased && alias_src.proc_path[0] != '\0')

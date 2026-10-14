@@ -87,18 +87,20 @@ int usb_sysfs_resolve_guest_path(const char *guest_path,
  */
 uint8_t *usb_sysfs_descriptors_dup(int busnum, int devnum, size_t *len_out);
 
-/* The guest /sys spelling of the object an open descriptor holds, for stamping
- * a synthetic identity on it.
+/* The guest /sys or /dev/bus spelling of the object an open descriptor holds,
+ * for stamping a synthetic identity on it.
  *
- * The name the guest opened is not always the name it got: a `subsystem` link
+ * The name the guest opened is not always the name it got: a subsystem link
  * opened for following names the directory it resolves to, and every relative
  * openat off that descriptor must walk from there. Asking the descriptor
- * instead of the request is what makes the two agree -- F_GETPATH reports the
+ * instead of the request is what makes the two agree: F_GETPATH reports the
  * link's own path for the O_PATH|O_NOFOLLOW open that deliberately named the
- * link, and the target's path for every open that followed it.
+ * link, and the target's path for every open that followed it. Under /dev/bus
+ * the request may spell a '..' the layer applied, and the descriptor names the
+ * directory it reached.
  *
- * Returns 1 with `out` filled, or 0 when the descriptor is not in the sysfs
- * tree (including when the tree does not exist).
+ * Returns 1 with @out filled, or 0 when the descriptor is in neither synthetic
+ * tree (including when the trees do not exist).
  */
 int usb_sysfs_guest_path_for_fd(int host_fd, char *out, size_t outsz);
 
