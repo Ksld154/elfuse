@@ -1352,6 +1352,28 @@ static bool proc_path_fd_is_dir(const fd_entry_t *snap)
     return true;
 }
 
+/* Rebuild @path against the guest directory @base as an absolute guest path,
+ * folding its components.
+ *
+ * Returns 0, or -1 with errno set to ENAMETOOLONG.
+ */
+static int path_rebuild_under(const char *base,
+                              const char *path,
+                              char *out,
+                              size_t outsz)
+{
+    size_t marks[PROC_PATH_COMPONENTS_MAX];
+    size_t depth;
+    if (proc_seed_absolute_path(base, out, outsz, marks, ARRAY_SIZE(marks),
+                                &depth) < 0 ||
+        proc_apply_components(path, out, outsz, marks, ARRAY_SIZE(marks),
+                              &depth) < 0) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
 int resolve_proc_dirfd_path(guest_fd_t dirfd,
                             const char *path,
                             char *out,
@@ -1387,16 +1409,8 @@ int resolve_proc_dirfd_path(guest_fd_t dirfd,
         return -1;
     }
 
-    size_t marks[PROC_PATH_COMPONENTS_MAX];
-    size_t depth;
-    if (proc_seed_absolute_path(snap.proc_path, out, outsz, marks,
-                                ARRAY_SIZE(marks), &depth) < 0 ||
-        proc_apply_components(path, out, outsz, marks, ARRAY_SIZE(marks),
-                              &depth) < 0) {
-        errno = ENAMETOOLONG;
+    if (path_rebuild_under(snap.proc_path, path, out, outsz) < 0)
         return -1;
-    }
-
     return 1;
 }
 
@@ -1414,24 +1428,12 @@ static int resolve_proc_cwd_path(const char *path, char *out, size_t outsz)
      * relative path measured against one has to be rebuilt as a guest path and
      * re-offered to the intercepts. Without the /sys and /dev/bus arms a cwd
      * set by fchdir() onto a synthetic USB directory would resolve relative
-     * names straight against the scratch tree. The component walk below is
-     * base-agnostic.
+     * names straight against the scratch tree.
      */
     int rc = 0;
     if (!strncmp(view.path, "/proc", 5) || !strncmp(view.path, "/dev/pts", 8) ||
-        !strncmp(view.path, "/sys", 4) || !strncmp(view.path, "/dev/bus", 8)) {
-        size_t marks[PROC_PATH_COMPONENTS_MAX];
-        size_t depth;
-        if (proc_seed_absolute_path(view.path, out, outsz, marks,
-                                    ARRAY_SIZE(marks), &depth) < 0 ||
-            proc_apply_components(path, out, outsz, marks, ARRAY_SIZE(marks),
-                                  &depth) < 0) {
-            errno = ENAMETOOLONG;
-            rc = -1;
-        } else {
-            rc = 1;
-        }
-    }
+        !strncmp(view.path, "/sys", 4) || !strncmp(view.path, "/dev/bus", 8))
+        rc = path_rebuild_under(view.path, path, out, outsz) < 0 ? -1 : 1;
 
     proc_release_cwd_view(&view);
     return rc;
@@ -1454,8 +1456,8 @@ int resolve_proc_at_path(guest_fd_t dirfd,
 
 /* Rebase a relative path against the host directory a descriptor points at,
  * producing the guest-visible absolute spelling: F_GETPATH names where the
- * directory lives on the host, path_host_to_guest strips the sysroot, and the
- * component walk folds "." and "..".
+ * directory lives on the host, path_host_to_guest strips the sysroot, and
+ * path_rebuild_under joins @rel to the result.
  *
  * This exists for relative walkers (systemd's chase() opens "/", then "sys",
  * then "bus", one openat per component) stepping from a host-backed directory
@@ -1498,14 +1500,7 @@ int path_rebase_hostdirfd(int host_dirfd,
     char guest_dir[LINUX_PATH_MAX];
     if (path_host_to_guest(host_dir, guest_dir, sizeof(guest_dir)) < 0)
         return 0;
-    size_t marks[PROC_PATH_COMPONENTS_MAX];
-    size_t depth;
-    if (proc_seed_absolute_path(guest_dir, out, outsz, marks, ARRAY_SIZE(marks),
-                                &depth) < 0 ||
-        proc_apply_components(rel, out, outsz, marks, ARRAY_SIZE(marks),
-                              &depth) < 0)
-        return 0;
-    return 1;
+    return path_rebuild_under(guest_dir, rel, out, outsz) < 0 ? 0 : 1;
 }
 
 bool path_openat2_stays_beneath(const char *path, bool clamp_at_root)
