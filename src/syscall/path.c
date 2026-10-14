@@ -646,6 +646,21 @@ int path_translate_at(guest_fd_t dirfd,
         }
     }
 
+    /* usb_sysfs_resolve_dev_climb rewrites a /dev/bus name whose '..' climbs
+     * out of it. What follows can climb out again, as in
+     * /dev/bus/../bus/../null, and each pass shortens the name. A climb can
+     * land in /sys, so this runs before the /sys rewrite below.
+     */
+    while (path_prefix_match(tx->guest_path, "/dev/bus", 8)) {
+        char resolved[LINUX_PATH_MAX];
+        if (!usb_sysfs_resolve_dev_climb(tx->guest_path, resolved,
+                                         sizeof(resolved)))
+            break;
+        str_copy_trunc(tx->guest_buf, resolved, sizeof(tx->guest_buf));
+        tx->guest_path = tx->guest_buf;
+        tx->intercept_path = tx->guest_buf;
+    }
+
     /* A /sys walk that passes through one of the synthetic USB `subsystem`
      * symlinks is rewritten to the canonical guest spelling of where it lands,
      * before anything decides whose name it is. The links exist only in the

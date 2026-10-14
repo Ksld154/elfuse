@@ -1724,7 +1724,7 @@ test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 	trap 'rm -rf "$$tmpdir"' EXIT; \
 	mkdir -p "$$sysroot/sys/class/net/eth0" \
 		"$$sysroot/sys/kernel/mm/transparent_hugepage" \
-		"$$sysroot/sys/devices/system/node"; \
+		"$$sysroot/sys/devices/system/node" "$$sysroot/dev"; \
 	printf '02:42:ac:11:00:02\n' > "$$sysroot/sys/class/net/eth0/address"; \
 	printf 'always [madvise] never\n' \
 		> "$$sysroot/sys/kernel/mm/transparent_hugepage/enabled"; \

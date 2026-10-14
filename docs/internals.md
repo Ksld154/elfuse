@@ -1687,6 +1687,16 @@ spelling instead splits the two halves apart in both directions:
 and `/dev/bus/other/../usb/001/002` reads as a foreign bus and is disowned.
 A suffix that folds away above its own root leaves as `USB_PATH_NONE`.
 
+A backing cannot apply such a `..` on `/dev/bus`: the directories are the
+layer's, and the macOS host has no `/dev/bus` at all. So a `/dev/bus` name that
+climbs out over the layer's own directories is first rewritten in the path
+layer to `/dev` followed by what comes after the `..` that climbed. A further
+`..` is applied to `/dev` and stops at `/`, so `/dev/bus/../../proc/self/status`
+reaches the `/proc` intercept. When the climb ends the name, the rewrite ends
+in `.`, as in `/dev/.`, so `rmdir` and `rename` fail rather than act on the
+directory reached, with `EINVAL` on a sysroot where Linux gives `ENOTEMPTY` and
+`EBUSY` for a final `..`.
+
 ### Filesystem Identity Of A Descriptor
 
 Two questions have one answer here: what `statfs` reports for a name, and what

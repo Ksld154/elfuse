@@ -4,7 +4,7 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * Recorded on Linux, not reasoned about: docker gcc:14 (aarch64, kernel 6.x)
+ * Recorded on Linux, not reasoned about: docker gcc:14 (aarch64, kernel 7.0)
  * over a real sysfs, with /dev/bus/other/f created and /dev/bus/usb/001/001
  * mknod'd as char 189:0. See the header comment in the test for the exact
  * command; MATRIX_RECORD=1 prints this block.
@@ -46,6 +46,10 @@
  *   sys-fold-in /sys/class/../bus/usb/devices
  *               synth-dir's directory, spelled through a /sys name only the
  *               backing has
+ *   dev-climb   /dev/bus/usb/001/../../..
+ *               out of /dev/bus over the layer's directories
+ *   dev-climb-f /dev/bus/other/f/../../../null
+ *               the same, after back-dev's file
  *
  * Two markers appear in the table.
  *
@@ -99,25 +103,25 @@
  */
 
 /* clang-format off */
-/*                       synth-dir  back-sys  back-dev  subsys  escape  escape-syn  usb-node  absent  long-sys  sys-root  dev-bus  shadow  subsys-out  dev-fold-out  dev-fold-in  sys-fold-in */
-/* open               */ {"ok",      "ok",     "ok",     "ok",   "ok",   "?ok",      "-",      "E2",   "ok",     "ok",     "ok",    "E2",   "ok",       "ok",         "-",         "?ok"},
-/* open_nofollow      */ {"ok",      "ok",     "ok",     "E40",  "ok",   "?ok",      "-",      "E2",   "ok",     "ok",     "ok",    "E2",   "ok",       "ok",         "-",         "?ok"},
-/* openat_dirfd       */ {"ok",      "ok",     "ok",     "ok",   "ok",   "?ok",      "-",      "E2",   "ok",     "skip",   "ok",    "skip", "ok",       "ok",         "-",         "?ok"},
-/* stat               */ {"ok:d",    "ok:d",   "ok:f",   "ok:d", "ok:f", "?ok:f",    "ok:c",   "E2",   "ok:f",   "ok:d",   "ok:d",  "E2",   "ok:d",     "ok:f",       "ok:c",      "?ok:d"},
-/* lstat              */ {"ok:d",    "ok:d",   "ok:f",   "ok:l", "ok:f", "?ok:f",    "ok:c",   "E2",   "ok:f",   "ok:d",   "ok:d",  "E2",   "ok:d",     "ok:f",       "ok:c",      "?ok:d"},
-/* fstatat_nofollow   */ {"ok:d",    "ok:d",   "ok:f",   "ok:l", "ok:f", "?ok:f",    "ok:c",   "E2",   "ok:f",   "ok:d",   "ok:d",  "E2",   "ok:d",     "ok:f",       "ok:c",      "?ok:d"},
-/* fstatat_dirfd      */ {"ok:d",    "ok:d",   "ok:f",   "ok:d", "ok:f", "?ok:f",    "ok:c",   "E2",   "ok:f",   "skip",   "ok:d",  "skip", "ok:d",     "ok:f",       "ok:c",      "?ok:d"},
-/* statx              */ {"ok:d",    "ok:d",   "ok:f",   "ok:d", "ok:f", "?ok:f",    "ok:c",   "E2",   "ok:f",   "ok:d",   "ok:d",  "E2",   "ok:d",     "ok:f",       "ok:c",      "?ok:d"},
-/* access             */ {"ok",      "ok",     "ok",     "ok",   "ok",   "?ok",      "ok",     "E2",   "ok",     "ok",     "ok",    "E2",   "ok",       "ok",         "ok",        "?ok"},
-/* faccessat_nofollow */ {"ok",      "ok",     "ok",     "ok",   "ok",   "?ok",      "ok",     "E2",   "ok",     "ok",     "ok",    "E2",   "ok",       "ok",         "ok",        "?ok"},
-/* readlink           */ {"E22",     "E22",    "E22",    "ok",   "E22",  "?E22",     "E22",    "E2",   "E22",    "E22",    "E22",   "E2",   "E22",      "E22",        "E22",       "?E22"},
-/* readlinkat_dirfd   */ {"E22",     "E22",    "E22",    "ok",   "E22",  "?E22",     "E22",    "E2",   "E22",    "skip",   "E22",   "skip", "E22",      "E22",        "E22",       "?E22"},
-/* getdents64         */ {"ok",      "ok",     "E20",    "ok",   "E20",  "?E20",     "E20",    "E2",   "E20",    "ok",     "ok",    "E2",   "ok",       "E20",        "E20",       "?ok"},
-/* statfs             */ {"sysfs",   "sysfs",  "other",  "sysfs","other","?other",   "other",  "E2",   "sysfs",  "sysfs",  "other", "E2",   "sysfs",    "other",      "other",     "sysfs"},
-/* fstatfs            */ {"sysfs",   "sysfs",  "other",  "sysfs","other","?other",   "other",  "E2",   "sysfs",  "sysfs",  "other", "E2",   "sysfs",    "other",      "other",     "?sysfs"},
-/* fstat_type         */ {"ok:d",    "ok:d",   "ok:f",   "ok:l", "ok:f", "?ok:f",    "ok:c",   "E2",   "ok:f",   "ok:d",   "ok:d",  "E2",   "ok:d",     "ok:f",       "ok:c",      "?ok:d"},
-/* chdir              */ {"ok",      "ok",     "E20",    "ok",   "E20",  "?E20",     "E20",    "E2",   "E20",    "ok",     "ok",    "E2",   "ok",       "E20",        "E20",       "?ok"},
-/* fchdir             */ {"ok",      "ok",     "E20",    "ok",   "E20",  "?E20",     "E20",    "E2",   "E20",    "ok",     "ok",    "E2",   "ok",       "E20",        "E20",       "?ok"},
-/* epoll_ctl          */ {"E1",      "E1",     "E1",     "E1",   "E1",   "?E1",      "-",      "E2",   "ok",     "E1",     "E1",    "E2",   "E1",       "E1",         "-",         "?E1"},
-/* union_listing      */ {"n/a",     "n/a",    "n/a",    "n/a",  "n/a",  "n/a",      "n/a",    "n/a",  "n/a",    "all",    "all",   "n/a",  "n/a",      "n/a",        "n/a",       "n/a"},
+/*                       synth-dir  back-sys  back-dev  subsys  escape  escape-syn  usb-node  absent  long-sys  sys-root  dev-bus  shadow  subsys-out  dev-fold-out  dev-fold-in  sys-fold-in  dev-climb  dev-climb-f */
+/* open               */ {"ok",      "ok",     "ok",     "ok",   "ok",   "?ok",      "-",      "E2",   "ok",     "ok",     "ok",    "E2",   "ok",       "ok",         "-",         "?ok",       "ok",      "E20"},
+/* open_nofollow      */ {"ok",      "ok",     "ok",     "E40",  "ok",   "?ok",      "-",      "E2",   "ok",     "ok",     "ok",    "E2",   "ok",       "ok",         "-",         "?ok",       "ok",      "E20"},
+/* openat_dirfd       */ {"ok",      "ok",     "ok",     "ok",   "ok",   "?ok",      "-",      "E2",   "ok",     "skip",   "ok",    "skip", "ok",       "ok",         "-",         "?ok",       "ok",      "skip"},
+/* stat               */ {"ok:d",    "ok:d",   "ok:f",   "ok:d", "ok:f", "?ok:f",    "ok:c",   "E2",   "ok:f",   "ok:d",   "ok:d",  "E2",   "ok:d",     "ok:f",       "ok:c",      "?ok:d",     "ok:d",    "E20"},
+/* lstat              */ {"ok:d",    "ok:d",   "ok:f",   "ok:l", "ok:f", "?ok:f",    "ok:c",   "E2",   "ok:f",   "ok:d",   "ok:d",  "E2",   "ok:d",     "ok:f",       "ok:c",      "?ok:d",     "ok:d",    "E20"},
+/* fstatat_nofollow   */ {"ok:d",    "ok:d",   "ok:f",   "ok:l", "ok:f", "?ok:f",    "ok:c",   "E2",   "ok:f",   "ok:d",   "ok:d",  "E2",   "ok:d",     "ok:f",       "ok:c",      "?ok:d",     "ok:d",    "E20"},
+/* fstatat_dirfd      */ {"ok:d",    "ok:d",   "ok:f",   "ok:d", "ok:f", "?ok:f",    "ok:c",   "E2",   "ok:f",   "skip",   "ok:d",  "skip", "ok:d",     "ok:f",       "ok:c",      "?ok:d",     "ok:d",    "skip"},
+/* statx              */ {"ok:d",    "ok:d",   "ok:f",   "ok:d", "ok:f", "?ok:f",    "ok:c",   "E2",   "ok:f",   "ok:d",   "ok:d",  "E2",   "ok:d",     "ok:f",       "ok:c",      "?ok:d",     "ok:d",    "E20"},
+/* access             */ {"ok",      "ok",     "ok",     "ok",   "ok",   "?ok",      "ok",     "E2",   "ok",     "ok",     "ok",    "E2",   "ok",       "ok",         "ok",        "?ok",       "ok",      "E20"},
+/* faccessat_nofollow */ {"ok",      "ok",     "ok",     "ok",   "ok",   "?ok",      "ok",     "E2",   "ok",     "ok",     "ok",    "E2",   "ok",       "ok",         "ok",        "?ok",       "ok",      "E20"},
+/* readlink           */ {"E22",     "E22",    "E22",    "ok",   "E22",  "?E22",     "E22",    "E2",   "E22",    "E22",    "E22",   "E2",   "E22",      "E22",        "E22",       "?E22",      "E22",     "E20"},
+/* readlinkat_dirfd   */ {"E22",     "E22",    "E22",    "ok",   "E22",  "?E22",     "E22",    "E2",   "E22",    "skip",   "E22",   "skip", "E22",      "E22",        "E22",       "?E22",      "E22",     "skip"},
+/* getdents64         */ {"ok",      "ok",     "E20",    "ok",   "E20",  "?E20",     "E20",    "E2",   "E20",    "ok",     "ok",    "E2",   "ok",       "E20",        "E20",       "?ok",       "ok",      "E20"},
+/* statfs             */ {"sysfs",   "sysfs",  "other",  "sysfs","other","?other",   "other",  "E2",   "sysfs",  "sysfs",  "other", "E2",   "sysfs",    "other",      "other",     "sysfs",     "other",   "E20"},
+/* fstatfs            */ {"sysfs",   "sysfs",  "other",  "sysfs","other","?other",   "other",  "E2",   "sysfs",  "sysfs",  "other", "E2",   "sysfs",    "other",      "other",     "?sysfs",    "other",   "E20"},
+/* fstat_type         */ {"ok:d",    "ok:d",   "ok:f",   "ok:l", "ok:f", "?ok:f",    "ok:c",   "E2",   "ok:f",   "ok:d",   "ok:d",  "E2",   "ok:d",     "ok:f",       "ok:c",      "?ok:d",     "ok:d",    "E20"},
+/* chdir              */ {"ok",      "ok",     "E20",    "ok",   "E20",  "?E20",     "E20",    "E2",   "E20",    "ok",     "ok",    "E2",   "ok",       "E20",        "E20",       "?ok",       "ok",      "E20"},
+/* fchdir             */ {"ok",      "ok",     "E20",    "ok",   "E20",  "?E20",     "E20",    "E2",   "E20",    "ok",     "ok",    "E2",   "ok",       "E20",        "E20",       "?ok",       "ok",      "E20"},
+/* epoll_ctl          */ {"E1",      "E1",     "E1",     "E1",   "E1",   "?E1",      "-",      "E2",   "ok",     "E1",     "E1",    "E2",   "E1",       "E1",         "-",         "?E1",       "E1",      "E20"},
+/* union_listing      */ {"n/a",     "n/a",    "n/a",    "n/a",  "n/a",  "n/a",      "n/a",    "n/a",  "n/a",    "all",    "all",   "n/a",  "n/a",      "n/a",        "n/a",       "n/a",       "n/a",     "n/a"},
     /* clang-format on */

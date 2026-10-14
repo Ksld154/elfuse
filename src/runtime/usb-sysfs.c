@@ -1254,28 +1254,44 @@ static bool bus_exists(int busnum)
     return false;
 }
 
-/* Fold '.' and '..' in a /sys-relative suffix, lexically.
- *
- * This is the ours/not-ours gate and nothing more: a suffix that folds away
- * above /sys is not a name this layer serves, and the caller reports
- * PROC_NOT_INTERCEPTED for it. Rejecting '..' outright (the syscpu_suffix_safe
- * contract) answered EACCES for /sys/bus/usb/devices/../devices/2-1, which
- * Linux resolves without complaint, so this folds instead.
- *
- * The fold is NOT how the served path is built. An earlier version claimed the
- * lexical fold was exact because `subsystem` links are always the last
- * component -- that is false, `<dev>/subsystem/..` puts one in the middle, and
- * Linux applies '..' to what the link resolved to (/sys/bus) rather than to the
- * directory the link sits in. usb_sys_resolve_suffix does the real resolution;
- * see it for how '..' and symlinks are ordered.
- *
- * A trailing slash survives the fold: it is what makes an attribute file used
- * as a directory report ENOTDIR.
- *
- * Returns 1 with out filled, 0 when the walk climbs above /sys (no longer ours;
- * the caller reports PROC_NOT_INTERCEPTED), -1 when the result does not fit.
+/* classify_path's answer for the /dev/bus-relative name @folded. */
+static usb_path_kind_t usb_dev_kind(const char *folded, int *bus)
+{
+    char path[LINUX_PATH_MAX];
+    int dev = 0;
+    const char *sfx = "";
+    int n = snprintf(path, sizeof(path), "/dev/bus/%s", folded);
+    if (n < 0 || (size_t) n >= sizeof(path))
+        return USB_PATH_NONE;
+    return classify_path(path, bus, &dev, &sfx);
+}
+
+/* Whether @folded names a directory the layer serves. Caller holds usb_lock
+ * after ensure_usb_tree().
  */
-static int usb_suffix_normalize(const char *suffix, char *out, size_t outsz)
+static bool usb_dev_names_dir(const char *folded)
+{
+    int bus = 0;
+    usb_path_kind_t kind = usb_dev_kind(folded, &bus);
+    return kind == USB_PATH_DEV_USB ||
+           (kind == USB_PATH_DEV_BUSNUM && bus_exists(bus));
+}
+
+/* Fold '.' and '..' in a /sys- or /dev/bus-relative suffix, lexically; a name
+ * that folds above its root is not this layer's. On /sys the fold decides only
+ * that, and usb_sys_resolve_suffix builds the served path. A trailing slash
+ * survives, so an attribute used as a directory reports ENOTDIR.
+ *
+ * Returns 1 with @out filled, 0 when the walk climbs above the root, -1 when
+ * the result does not fit. With @rest, under usb_lock after ensure_usb_tree(),
+ * a '..' pops only a directory usb_dev_names_dir accepts, and *@rest is left on
+ * what follows a climbing '..', or NULL when a '..' meets any other name.
+ * Without @rest no lock is held, and any other name is popped unchecked.
+ */
+static int usb_suffix_normalize(const char *suffix,
+                                char *out,
+                                size_t outsz,
+                                const char **rest)
 {
     size_t len = 0;
     size_t marks[64];
@@ -1292,8 +1308,15 @@ static int usb_suffix_normalize(const char *suffix, char *out, size_t outsz)
         if (seglen == 0 || (seglen == 1 && seg[0] == '.'))
             continue;
         if (seglen == 2 && seg[0] == '.' && seg[1] == '.') {
-            if (depth == 0)
-                return 0; /* above /sys */
+            if (depth == 0) {
+                if (rest)
+                    *rest = p;
+                return 0; /* above the root */
+            }
+            if (rest && !usb_dev_names_dir(out)) {
+                *rest = NULL;
+                return 0;
+            }
             len = marks[--depth];
             out[len] = '\0';
             continue;
@@ -1530,7 +1553,7 @@ static usb_path_kind_t classify_and_normalize(const char *path,
     if (path_prefix_match(path, "/dev/bus", 8)) {
         char folded[LINUX_PATH_MAX];
         int frc = usb_suffix_normalize(skip_slashes(path + 8), folded,
-                                       sizeof(folded));
+                                       sizeof(folded), NULL);
         if (frc < 0) {
             *err_out = ENAMETOOLONG;
             return USB_PATH_NONE;
@@ -1551,7 +1574,7 @@ static usb_path_kind_t classify_and_normalize(const char *path,
         return USB_PATH_NONE; /* another bus's /dev/bus subtree; not ours */
     if (kind != USB_PATH_SYS)
         return kind;
-    int rc = usb_suffix_normalize(*sfx_out, norm, normsz);
+    int rc = usb_suffix_normalize(*sfx_out, norm, normsz, NULL);
     if (rc < 0) {
         *err_out = ENAMETOOLONG;
         return USB_PATH_NONE;
@@ -2293,6 +2316,43 @@ int usb_sysfs_resolve_guest_path(const char *guest_path,
 out:
     pthread_mutex_unlock(&usb_lock);
     return rc;
+}
+
+bool usb_sysfs_resolve_dev_climb(const char *guest_path,
+                                 char *out,
+                                 size_t outsz)
+{
+    if (!path_prefix_match(guest_path, "/dev/bus", 8) ||
+        !strstr(guest_path, ".."))
+        return false;
+    char folded[LINUX_PATH_MAX];
+    const char *rest = NULL;
+    pthread_mutex_lock(&usb_lock);
+    bool climbs = ensure_usb_tree() == 0 &&
+                  usb_suffix_normalize(skip_slashes(guest_path + 8), folded,
+                                       sizeof(folded), &rest) == 0 &&
+                  rest;
+    pthread_mutex_unlock(&usb_lock);
+    if (!climbs)
+        return false;
+
+    /* A further '..' climbs /dev, and one past it stays at the root as on
+     * Linux; left in the name, it reaches the backing as /dev/.., where no
+     * intercept matches what it lands on.
+     */
+    const char *dir = "/dev";
+    while (rest[0] == '.' && rest[1] == '.' &&
+           (rest[2] == '/' || rest[2] == '\0')) {
+        dir = "";
+        rest = skip_slashes(rest + 2);
+    }
+
+    /* When the climb ends the name, the rewrite ends in '.', so rmdir and
+     * rename fail rather than act on the directory reached, with EINVAL on a
+     * sysroot where Linux gives ENOTEMPTY and EBUSY for a final '..'.
+     */
+    int n = snprintf(out, outsz, "%s/%s", dir, *rest ? rest : ".");
+    return n > 0 && (size_t) n < outsz;
 }
 
 bool usb_sysfs_dir_unions_backing(const char *guest_path)

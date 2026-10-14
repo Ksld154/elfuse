@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Code under test: src/runtime/usb-sysfs.c, plus the sysfs statfs arms in
- * src/syscall/fs-stat.c.
+ * src/syscall/fs-stat.c and the /dev/bus climb rewrite in path_translate_at
+ * (src/syscall/path.c).
  *
  * Two halves. The first asserts what holds with no USB device attached at all:
  * SYSFS_MAGIC from statfs and fstatfs alike, the read-only open contract, and
@@ -1184,6 +1185,100 @@ static void check_dev_bus_names(void)
         close(fd);
 }
 
+/* Whether @a and @b describe the same file. */
+static bool same_inode(const struct stat *a, const struct stat *b)
+{
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
+}
+
+/* Whether @path names the same file as @want. */
+static bool same_file(const char *path, const struct stat *want)
+{
+    struct stat st;
+    return stat(path, &st) == 0 && same_inode(&st, want);
+}
+
+/* A '..' out of /dev/bus lands in /dev however the name is reached, and a
+ * further '..' climbs on from there.
+ */
+static void check_dotdot_leaves_bus(void)
+{
+    static const char *const nulls[] = {
+        "/dev/bus/../null",           "/dev/bus/../bus/../null",
+        "/dev/bus/.././bus/../null",  "/dev/bus/../../dev/null",
+        "/dev/bus/../../../dev/null", "/dev/bus/../../dev/bus/../null",
+    };
+    static const char *const climbs[][2] = {
+        {"/dev/bus/usb/001/../../..", "/dev"},
+        {"/dev/bus/../..", "/"},
+        {"/dev/bus/../../dev/bus/usb", "/dev/bus/usb"},
+        {"/dev/bus/usb/001/../../../../sys/bus/usb/devices",
+         "/sys/bus/usb/devices"},
+        {"/dev/bus/../../proc/self/status", "/proc/self/status"},
+        {"/dev/bus/../../../proc/self/status", "/proc/self/status"},
+    };
+    struct stat dev_st, null_st, st;
+    char what[96], cwd[64];
+
+    TEST("/dev and /dev/null are stat-able");
+    if (stat("/dev", &dev_st) != 0 || stat("/dev/null", &null_st) != 0) {
+        FAIL("stat");
+        return;
+    }
+    PASS();
+
+    for (size_t i = 0; i < sizeof(nulls) / sizeof(nulls[0]); i++) {
+        snprintf(what, sizeof(what), "%s is /dev/null", nulls[i]);
+        TEST(what);
+        EXPECT_TRUE(same_file(nulls[i], &null_st), nulls[i]);
+    }
+
+    TEST("/dev/bus/.. is /dev");
+    EXPECT_TRUE(same_file("/dev/bus/..", &dev_st), "stat(\"/dev/bus/..\")");
+
+    for (size_t i = 0; i < sizeof(climbs) / sizeof(climbs[0]); i++) {
+        snprintf(what, sizeof(what), "%s is %s", climbs[i][0], climbs[i][1]);
+        TEST(what);
+        EXPECT_TRUE(
+            stat(climbs[i][1], &st) == 0 && same_file(climbs[i][0], &st),
+            climbs[i][0]);
+    }
+
+    TEST("a '..' out through a bus no device has is ENOENT");
+    EXPECT_ERRNO(stat("/dev/bus/usb/099/../../../null", &st), ENOENT,
+                 "stat(\"/dev/bus/usb/099/../../../null\")");
+
+    TEST("../null against a /dev/bus dirfd is /dev/null");
+    int dfd = open("/dev/bus", O_RDONLY | O_DIRECTORY);
+    EXPECT_TRUE(dfd >= 0 && fstatat(dfd, "../null", &st, 0) == 0 &&
+                    same_inode(&st, &null_st),
+                "fstatat(/dev/bus, \"../null\")");
+    if (dfd >= 0)
+        close(dfd);
+
+    TEST("chdir .. from /dev/bus reaches /dev");
+    if (chdir("/dev/bus") != 0 || chdir("..") != 0)
+        FAIL("chdir /dev/bus, then ..");
+    else if (!getcwd(cwd, sizeof(cwd)) || strcmp(cwd, "/dev"))
+        FAIL("getcwd after chdir ..");
+    else if (!same_file("null", &null_st))
+        FAIL("stat(\"null\") in /dev");
+    else
+        PASS();
+    if (chdir("/") != 0)
+        FAIL("chdir back to /");
+
+    TEST("chdir /dev/bus/usb/001/../../.. reaches /dev");
+    if (chdir("/dev/bus/usb/001/../../..") != 0)
+        FAIL("chdir /dev/bus/usb/001/../../..");
+    else if (!getcwd(cwd, sizeof(cwd)) || strcmp(cwd, "/dev"))
+        FAIL("getcwd after chdir /dev/bus/usb/001/../../..");
+    else
+        PASS();
+    if (chdir("/") != 0)
+        FAIL("chdir back to /");
+}
+
 int main(void)
 {
     printf("test-usb-sysfs: synthetic USB tree contract\n");
@@ -1192,6 +1287,7 @@ int main(void)
     check_slurp_reads_whole_files();
     int ndev = check_devices();
     check_dev_bus_names();
+    check_dotdot_leaves_bus();
 
     /* Stated, not implied: the second half is only as strong as the bus it ran
      * against, and a zero here means those assertions did not execute.
