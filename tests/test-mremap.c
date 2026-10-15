@@ -6,7 +6,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Tests: mremap grow, shrink, MREMAP_MAYMOVE, MREMAP_FIXED,
- *        overflow checks, overlapping fixed ranges.
+ *        overflow checks, overlapping fixed ranges, moving the vDSO.
  *
  * Syscalls exercised: mmap(222), mremap(216), munmap(215)
  */
@@ -15,6 +15,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -486,6 +487,74 @@ static void test_grow_mapped_suffix(void)
     check_grow_occupied_suffix(base, base + page);
 }
 
+/* Test 12: a handler still returns after the vDSO is moved */
+
+static volatile sig_atomic_t vdso_handled;
+
+static void vdso_handler(int sig)
+{
+    (void) sig;
+    vdso_handled = 1;
+}
+
+static bool find_vdso(uintptr_t *lo, uintptr_t *hi)
+{
+    FILE *fp = fopen("/proc/self/maps", "r");
+    if (!fp)
+        return false;
+    char line[512];
+    bool found = false;
+    while (!found && fgets(line, sizeof(line), fp)) {
+        unsigned long l, h;
+        found = strstr(line, "[vdso]") && sscanf(line, "%lx-%lx", &l, &h) == 2;
+        if (found) {
+            *lo = l;
+            *hi = h;
+        }
+    }
+    fclose(fp);
+    return found;
+}
+
+/* A handler returns through the vDSO sigreturn trampoline. Linux follows a
+ * moved vDSO and elfuse refuses the move; either way the handler returns.
+ */
+static void test_vdso_move(void)
+{
+    TEST("mremap of [vdso] keeps signals");
+
+    uintptr_t lo, hi;
+    if (!find_vdso(&lo, &hi)) {
+        FAIL("no [vdso] in /proc/self/maps");
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        FAIL("fork failed");
+        return;
+    }
+    if (pid == 0) {
+        size_t len = hi - lo;
+        void *dst =
+            mmap(NULL, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (dst == MAP_FAILED)
+            _exit(2);
+        mremap((void *) lo, len, len, MREMAP_MAYMOVE | MREMAP_FIXED, dst);
+        signal(SIGUSR1, vdso_handler);
+        raise(SIGUSR1);
+        _exit(vdso_handled ? 0 : 3);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) {
+        FAIL("waitpid failed");
+        return;
+    }
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                "handler did not return");
+}
+
 int main(void)
 {
     printf("test-mremap: mremap syscall tests\n");
@@ -501,6 +570,7 @@ int main(void)
     test_source_range_hole();
     test_grow_adjacent_mapping();
     test_grow_mapped_suffix();
+    test_vdso_move();
 
     SUMMARY("test-mremap");
     return fails > 0 ? 1 : 0;
