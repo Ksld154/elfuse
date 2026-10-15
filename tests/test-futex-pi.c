@@ -15,6 +15,9 @@
  *      post-robust-walk state (FUTEX_OWNER_DIED set, TID cleared) must take
  *      the lock over and return 0, not spin on the CAS(0->TID) fast path.
  *
+ *   1c. FUTEX_LOCK_PI on a word with FUTEX_WAITERS set and no TID takes the
+ *      lock over, as Linux does, for the same reason.
+ *
  *   2. FUTEX_LOCK_PI + FUTEX_UNLOCK_PI round-trip: acquire and
  *      release a PI lock from the same thread.
  *
@@ -253,6 +256,35 @@ static void test_pi_owner_died_recover(void)
     uint32_t val = __atomic_load_n(&pi_lock, __ATOMIC_SEQ_CST);
     if ((val & FUTEX_TID_MASK) != tid) {
         FAIL("lock word doesn't contain our TID after recovery");
+        return;
+    }
+
+    raw_futex_unlock_pi((uint32_t *) &pi_lock);
+    PASS();
+}
+
+/* Test: LOCK_PI takes a word that has FUTEX_WAITERS but no owner */
+
+static void test_pi_waiters_no_owner(void)
+{
+    TEST("PI LOCK_PI takes a WAITERS-only word");
+
+    /* Linux takes this word over (futex_lock_pi_atomic). The CAS(0->TID) fast
+     * path never matches it, so a retry loop without a takeover spins forever.
+     */
+    pi_lock = FUTEX_WAITERS;
+
+    long r = raw_futex_lock_pi((uint32_t *) &pi_lock);
+    if (r != 0) {
+        printf("FAIL: LOCK_PI on a WAITERS-only word expected 0, got %ld\n", r);
+        fails++;
+        return;
+    }
+
+    uint32_t tid = (uint32_t) raw_gettid();
+    uint32_t val = __atomic_load_n(&pi_lock, __ATOMIC_SEQ_CST);
+    if ((val & FUTEX_TID_MASK) != tid) {
+        FAIL("lock word doesn't contain our TID after takeover");
         return;
     }
 
@@ -562,6 +594,7 @@ int main(void)
     test_futex_eintr();
     test_futex_unaligned();
     test_pi_owner_died_recover();
+    test_pi_waiters_no_owner();
     test_pi_owner_relock();
     test_pi_dead_owner(); /* Last: uses CLONE_THREAD which may hang on x64 */
 

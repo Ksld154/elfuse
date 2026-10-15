@@ -1592,8 +1592,27 @@ static int64_t futex_lock_pi_inner(guest_t *g,
                 break;
         }
 
-        /* Owner released first: retry the acquisition. */
         if (futex_pi_unowned(cur)) {
+            /* FUTEX_WAITERS with no TID never matches the fast path's
+             * CAS(0->TID), so take the word here, as futex_lock_pi_atomic does
+             * on Linux. The bit stays while another waiter is queued.
+             * FUTEX_OWNER_DIED is left to the recovery at the top.
+             */
+            if (cur != 0 && !futex_pi_owner_died(cur)) {
+                uint32_t want = tid;
+                if (bucket_has_uaddr_locked(b, uaddr))
+                    want = futex_pi_set_waiters(tid);
+                bool taken;
+                if (!futex_word_cas(word, &cur, want, &taken)) {
+                    pthread_mutex_unlock(&b->lock);
+                    return -LINUX_EFAULT;
+                }
+                if (taken) {
+                    pthread_mutex_unlock(&b->lock);
+                    return 0;
+                }
+            }
+            /* Owner released first, or the word moved: retry. */
             pthread_mutex_unlock(&b->lock);
             continue;
         }
