@@ -80,6 +80,17 @@ int usb_sysfs_resolve_guest_path(const char *guest_path,
  */
 bool usb_sysfs_names_node(const char *guest_path);
 
+/* The canonical /dev/bus/usb/BBB/DDD spelling of @guest_path when it names a
+ * usbfs node once its '.' and '..' are folded as the stat intercept folds them.
+ * usbdev_open_path takes only that spelling. A name that ends in the directory
+ * requirement path_dir_required reports is left to the intercepts, which answer
+ * ENOTDIR for a node.
+ *
+ * Returns true with @out filled, or false when @guest_path names no node or the
+ * folded name does not fit @outsz.
+ */
+bool usb_sysfs_node_path(const char *guest_path, char *out, size_t outsz);
+
 /* Rewrite a /dev/bus name that climbs out of /dev/bus with '..', popping only
  * directories the layer serves, to /dev followed by what comes after the '..'
  * that climbed, or to /dev/. when nothing does. Those directories are the

@@ -881,17 +881,26 @@ int64_t sys_openat_path(guest_t *g,
         return guest_fd;
     }
 
+    char usb_node[sizeof("/dev/bus/usb/BBB/DDD")];
+
     /* Intercept /proc and /dev paths before touching the host filesystem */
     if (path_might_use_open_intercept(tx.intercept_path)) {
         if (!strcmp(tx.intercept_path, "/dev/fuse"))
             return fuse_proc_open(linux_flags);
 
         /* /dev/bus/usb/BBB/DDD: typed FD_USBDEV constructor (any access mode
-         * except O_PATH, which the stage-1 placeholder serves).
+         * except O_PATH, which the stage-1 placeholder serves). A node named
+         * through '..' is passed on as /dev/bus/usb/BBB/DDD, the only spelling
+         * usbdev_open_path accepts and the one the placeholder's descriptor is
+         * stamped with.
          */
-        int64_t usb_fd = usbdev_open_path(tx.intercept_path, linux_flags);
-        if (usb_fd != INT64_MIN)
-            return usb_fd;
+        if (usb_sysfs_node_path(tx.intercept_path, usb_node,
+                                sizeof(usb_node))) {
+            tx.intercept_path = usb_node;
+            int64_t usb_fd = usbdev_open_path(usb_node, linux_flags);
+            if (usb_fd != INT64_MIN)
+                return usb_fd;
+        }
         int64_t fuse_fd =
             fuse_open_path(g, tx.intercept_path, linux_flags, mode);
         if (fuse_fd != INT64_MIN)

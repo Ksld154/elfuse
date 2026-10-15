@@ -2335,6 +2335,16 @@ bool usb_sysfs_names_node(const char *guest_path)
            classify_path(guest_path, &bus, &dev, &sfx) == USB_PATH_DEV_NODE;
 }
 
+bool usb_sysfs_node_path(const char *guest_path, char *out, size_t outsz)
+{
+    int bus = 0, dev = 0, cerr = 0;
+    const char *sfx = NULL;
+    return path_prefix_match(guest_path, "/dev/bus", 8) &&
+           !path_dir_required(guest_path) &&
+           classify_and_normalize(guest_path, &bus, &dev, &sfx, out, outsz,
+                                  &cerr) == USB_PATH_DEV_NODE;
+}
+
 bool usb_sysfs_resolve_dev_climb(const char *guest_path,
                                  char *out,
                                  size_t outsz)

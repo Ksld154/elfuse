@@ -1334,8 +1334,9 @@ static void check_hostdir_openat(const char *dir, const char *rel, bool enotdir)
     close(hfd);
 }
 
-/* A '..' after a usbfs node is ENOTDIR however the name is reached; chdir and
- * fchdir publish the cwd through different code.
+/* A '..' after a usbfs node is ENOTDIR however the name is reached, and a node
+ * reached through any other '..' opens as itself; chdir and fchdir publish the
+ * cwd through different code.
  */
 static void check_node_dotdot_relative(void)
 {
@@ -1386,6 +1387,27 @@ static void check_node_dotdot_relative(void)
     EXPECT_TRUE(fd >= 0, "openat(/dev/bus/usb/001, \"../001/001\", O_RDWR)");
     if (fd >= 0)
         close(fd);
+
+    /* An absolute name keeps its '..' through path translation, so
+     * sys_openat_path folds it for usbdev_open_path.
+     */
+    TEST("/dev/bus/usb/001/../001/001 opens read-write as the node");
+    fd = open("/dev/bus/usb/001/../001/001", O_RDWR);
+    EXPECT_TRUE(fd >= 0 && fd_names(fd, "/dev/bus/usb/001/001"),
+                "open(\"/dev/bus/usb/001/../001/001\", O_RDWR)");
+    if (fd >= 0)
+        close(fd);
+
+    TEST("an O_PATH open through '..' is named as the node");
+    fd = open("/dev/bus/usb/001/../001/001", O_PATH);
+    EXPECT_TRUE(fd >= 0 && fd_names(fd, "/dev/bus/usb/001/001"),
+                "open(\"/dev/bus/usb/001/../001/001\", O_PATH)");
+    if (fd >= 0)
+        close(fd);
+
+    TEST("/dev/bus/usb/001/../001/001/. is ENOTDIR");
+    EXPECT_ERRNO(open("/dev/bus/usb/001/../001/001/.", O_RDWR), ENOTDIR,
+                 "open(\"/dev/bus/usb/001/../001/001/.\", O_RDWR)");
 
     TEST("a climb from a /dev/bus/usb/001 dirfd reaches /sys");
     fd = openat(dfd, "../../../../sys/bus/usb/devices", O_RDONLY | O_DIRECTORY);
