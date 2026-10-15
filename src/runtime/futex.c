@@ -392,6 +392,16 @@ static futex_bucket_t *futex_waiter_follow(futex_bucket_t *b,
     }
 }
 
+/* Whether any waiter on @uaddr is queued in @b. Caller must hold b->lock. */
+static bool bucket_has_uaddr_locked(const futex_bucket_t *b, uint64_t uaddr)
+{
+    for (const futex_waiter_t *w = b->head; w; w = w->next) {
+        if (w->uaddr == uaddr)
+            return true;
+    }
+    return false;
+}
+
 /* Unlink the waiter at *pp from its bucket list and wake it. The bucket lock
  * must be held. Unlinking before the store/signal keeps a woken waiter from
  * observing itself still queued; the release store pairs with the waiter's
@@ -1655,18 +1665,14 @@ static int64_t futex_lock_pi_inner(guest_t *g,
                                                  memory_order_acquire)) {
                     /* Timeout: dequeue and return */
                     bucket_unlink_locked(b, &waiter);
-                    /* Only clear WAITERS bit if no waiters for this address */
-                    bool has_waiters = false;
-                    for (futex_waiter_t *w = b->head; w; w = w->next) {
-                        if (w->uaddr == uaddr) {
-                            has_waiters = true;
-                            break;
-                        }
-                    }
+
+                    /* Clear under the lock: a waiter that enqueues once it is
+                     * dropped relies on the bit it reads staying set.
+                     */
+                    if (!bucket_has_uaddr_locked(b, uaddr))
+                        futex_clear_waiters_bit(word);
                     pthread_mutex_unlock(&b->lock);
                     pthread_cond_destroy(&waiter.cond);
-                    if (!has_waiters)
-                        futex_clear_waiters_bit(word);
                     return -LINUX_ETIMEDOUT;
                 }
             } else {
