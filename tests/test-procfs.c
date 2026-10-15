@@ -9,7 +9,8 @@
  *   1. /proc/self/auxv returns valid auxv with AT_PAGESZ=4096
  *   2. /proc/self/environ contains at least one entry
  *   3. /proc/self/cmdline is non-empty
- *   4. /proc/self/maps contains [heap] and [stack]
+ *   4. /proc/self/maps contains [heap] and [stack], every offset is
+ *      page-aligned, and the lines add up to VmSize
  *   5. /proc/self/status contains correct PID
  *
  * Syscalls: openat(56), read(63), close(57), getpid(172)
@@ -18,6 +19,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 
@@ -67,6 +69,35 @@ static bool parse_proc_stat_field_u64(const char *buf,
     return false;
 }
 
+/* Walk the maps text in @buf: add each line's size to @total, leaving out the
+ * elfuse runtime records ([shim], [shim-data]) a Linux process does not have,
+ * and report whether every file offset is page-aligned.
+ */
+static bool maps_walk(char *buf, uint64_t *total)
+{
+    bool aligned = true;
+    *total = 0;
+    for (char *line = buf; *line;) {
+        char *nl = strchr(line, '\n');
+        if (nl)
+            *nl = '\0';
+        char *p;
+        uint64_t lo = strtoull(line, &p, 16);
+        if (*p == '-') {
+            uint64_t hi = strtoull(p + 1, &p, 16);
+            uint64_t off = strtoull(p + 6, NULL, 16); /* past " rwxp " */
+            if (!strstr(line, "[shim"))
+                *total += hi - lo;
+            aligned &= (off & 0xfff) == 0;
+        }
+        if (!nl)
+            break;
+        *nl = '\n';
+        line = nl + 1;
+    }
+    return aligned;
+}
+
 static bool parse_stack_range(const char *buf, uint64_t *start, uint64_t *end)
 {
     const char *line = buf;
@@ -94,11 +125,16 @@ static bool read_stack_range(uint64_t *start, uint64_t *end)
     return maps_n > 0 && parse_stack_range(mapsbuf, start, end);
 }
 
-static bool read_start_stack(const char *path, uint64_t *start_stack)
+static bool read_stat_field(const char *path, int field, uint64_t *value)
 {
     char statbuf[1024];
     ssize_t stat_n = raw_read_file_nul(path, statbuf, sizeof(statbuf));
-    return stat_n > 0 && parse_proc_stat_field_u64(statbuf, 28, start_stack);
+    return stat_n > 0 && parse_proc_stat_field_u64(statbuf, field, value);
+}
+
+static bool read_start_stack(const char *path, uint64_t *start_stack)
+{
+    return read_stat_field(path, 28, start_stack);
 }
 
 static bool start_stack_is_recorded(uint64_t start_stack, uint64_t stack_end)
@@ -191,6 +227,44 @@ int main(void)
             } else {
                 FAIL("empty maps");
             }
+        }
+    }
+
+    TEST("procfs: maps offsets page-aligned, lines add up to VmSize");
+    {
+        static char mapsbuf[65536];
+        uint64_t maps_total = 0;
+        n = raw_read_file_nul("/proc/self/maps", mapsbuf, sizeof(mapsbuf));
+        bool aligned = n > 0 && maps_walk(mapsbuf, &maps_total);
+        n = raw_read_file_nul("/proc/self/status", buf, sizeof(buf));
+        char *vm = n > 0 ? strstr(buf, "VmSize:") : NULL;
+        uint64_t vm_kb = vm ? strtoull(vm + 7, NULL, 10) : 0;
+        if (aligned && vm_kb * 1024 == maps_total) {
+            PASS();
+        } else {
+            printf("FAIL: aligned %d, VmSize %llu kB, maps %llu kB\n", aligned,
+                   (unsigned long long) vm_kb,
+                   (unsigned long long) (maps_total / 1024));
+            fails++;
+        }
+    }
+
+    TEST("procfs: stat vsize is VmSize, VmRSS within it");
+    {
+        n = raw_read_file_nul("/proc/self/status", buf, sizeof(buf));
+        char *vm = n > 0 ? strstr(buf, "VmSize:") : NULL;
+        char *rss = n > 0 ? strstr(buf, "VmRSS:") : NULL;
+        uint64_t vm_kb = vm ? strtoull(vm + 7, NULL, 10) : 0;
+        uint64_t rss_kb = rss ? strtoull(rss + 6, NULL, 10) : 0;
+        uint64_t vsize = 0;
+        bool have_vsize = read_stat_field("/proc/self/stat", 23, &vsize);
+        if (have_vsize && vm_kb && vsize == vm_kb * 1024 && rss_kb <= vm_kb) {
+            PASS();
+        } else {
+            printf("FAIL: VmSize %llu kB, VmRSS %llu kB, vsize %llu kB\n",
+                   (unsigned long long) vm_kb, (unsigned long long) rss_kb,
+                   (unsigned long long) (vsize / 1024));
+            fails++;
         }
     }
 

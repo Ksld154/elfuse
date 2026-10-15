@@ -2392,20 +2392,20 @@ static int intercept_open_dispatch(const guest_t *g,
 
     /* /proc/self/status -> synthetic process status */
     if (!strcmp(path, "/proc/self/status")) {
-        /* Compute VmSize from region tracking (total virtual memory) */
-        uint64_t vm_size_kb = 0;
-        for (int i = 0; i < g->nregions; i++)
-            vm_size_kb += (g->regions[i].end - g->regions[i].start);
-        vm_size_kb /= 1024;
-
-        /* VmRSS: approximate as non-PROT_NONE regions (HVF cannot query actual
-         * residency from HVF, but mapped != PROT_NONE is close)
+        /* VmSize is total_vm, which leaves out [shim] and [shim-data]. VmRSS
+         * approximates residency as the non-PROT_NONE part of it, since HVF
+         * cannot report which pages are resident.
          */
-        uint64_t vm_rss_kb = 0;
+        uint64_t vm_size_kb = 0, vm_rss_kb = 0;
         for (int i = 0; i < g->nregions; i++) {
-            if (g->regions[i].prot != 0) /* PROT_NONE = 0 */
-                vm_rss_kb += (g->regions[i].end - g->regions[i].start);
+            const guest_region_t *r = &g->regions[i];
+            if (!guest_region_in_process_vm(g, r))
+                continue;
+            vm_size_kb += r->end - r->start;
+            if (r->prot != LINUX_PROT_NONE)
+                vm_rss_kb += r->end - r->start;
         }
+        vm_size_kb /= 1024;
         vm_rss_kb /= 1024;
 
         /* Linux uses the comm name (basename truncated to 15 chars). */
@@ -2804,15 +2804,18 @@ static int intercept_open_dispatch(const guest_t *g,
         long stime_ticks =
             ru.ru_stime.tv_sec * 100 + ru.ru_stime.tv_usec / 10000;
 
-        /* Compute vsize and rss from guest region tracking */
+        /* vsize and rss cover the regions VmSize and VmRSS count. */
         uint64_t vsize = 0, rss_pages = 0;
         long page_size = sysconf(_SC_PAGESIZE);
         if (page_size <= 0)
             page_size = 4096;
         for (int i = 0; i < g->nregions; i++) {
-            uint64_t sz = g->regions[i].end - g->regions[i].start;
+            const guest_region_t *r = &g->regions[i];
+            if (!guest_region_in_process_vm(g, r))
+                continue;
+            uint64_t sz = r->end - r->start;
             vsize += sz;
-            if (g->regions[i].prot != 0) /* non-PROT_NONE = resident */
+            if (r->prot != LINUX_PROT_NONE) /* non-PROT_NONE = resident */
                 rss_pages += sz / (uint64_t) page_size;
         }
 
