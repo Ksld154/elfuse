@@ -1266,6 +1266,14 @@ static usb_path_kind_t usb_dev_kind(const char *folded, int *bus)
     return classify_path(path, bus, &dev, &sfx);
 }
 
+/* Whether @folded starts with a usbfs node. */
+static bool usb_dev_names_node(const char *folded)
+{
+    int bus = 0;
+    usb_path_kind_t kind = usb_dev_kind(folded, &bus);
+    return kind == USB_PATH_DEV_NODE || kind == USB_PATH_DEV_NODE_SUB;
+}
+
 /* Whether @folded names a directory the layer serves. Caller holds usb_lock
  * after ensure_usb_tree().
  */
@@ -1277,9 +1285,11 @@ static bool usb_dev_names_dir(const char *folded)
            (kind == USB_PATH_DEV_BUSNUM && bus_exists(bus));
 }
 
-/* Fold '.' and '..' in a /sys- or /dev/bus-relative suffix, lexically; a name
- * that folds above its root is not this layer's. On /sys the fold decides only
- * that, and usb_sys_resolve_suffix builds the served path. A trailing slash
+/* Fold '.' and '..' in a /sys- or, with @dev, a /dev/bus-relative suffix,
+ * lexically; a name that folds above its root is not this layer's. On /sys the
+ * fold decides only that, and usb_sys_resolve_suffix builds the served path.
+ * With @dev a '..' after a usbfs node stops the fold and the rest is kept as
+ * written, since Linux applies '..' only to a directory. A trailing slash
  * survives, so an attribute used as a directory reports ENOTDIR.
  *
  * Returns 1 with @out filled, 0 when the walk climbs above the root, -1 when
@@ -1289,6 +1299,7 @@ static bool usb_dev_names_dir(const char *folded)
  * Without @rest no lock is held, and any other name is popped unchecked.
  */
 static int usb_suffix_normalize(const char *suffix,
+                                bool dev,
                                 char *out,
                                 size_t outsz,
                                 const char **rest)
@@ -1316,6 +1327,14 @@ static int usb_suffix_normalize(const char *suffix,
             if (rest && !usb_dev_names_dir(out)) {
                 *rest = NULL;
                 return 0;
+            }
+            if (dev && usb_dev_names_node(out)) {
+                size_t rlen = strlen(seg); /* this '..' and all after it */
+                if (len + 1 + rlen + 1 > outsz)
+                    return -1;
+                out[len++] = '/';
+                memcpy(out + len, seg, rlen + 1);
+                return 1;
             }
             len = marks[--depth];
             out[len] = '\0';
@@ -1527,22 +1546,12 @@ static usb_path_kind_t classify_and_normalize(const char *path,
     *err_out = 0;
 
     /* Fold the /dev/bus suffix before classify_path reads it, so both halves of
-     * the layer reach ownership the same way. The /sys half has always folded
-     * first and decided after; the /dev half used to classify the guest's
-     * spelling as written, and a '..' crossing the boundary then went wrong in
-     * both directions. /dev/bus/usb/../other/f reached parse_ddd's failure arm
-     * and came back USB_PATH_DEV_ABSENT, so the layer claimed the name and
-     * answered ENOENT for a file the sysroot really has;
-     * /dev/bus/other/../usb/001/002 classified as USB_PATH_DEV_FOREIGN, fell
-     * through, and missed the synthetic node because no sysroot carries a
-     * /dev/bus/usb. Both spellings are matrix columns now (dev-fold-out and
-     * dev-fold-in).
+     * the layer reach ownership the same way: /dev/bus/usb/../other/f is the
+     * backing's file and /dev/bus/other/../usb/001/001 is the synthetic node
+     * (matrix columns dev-fold-out and dev-fold-in).
      *
-     * The fold is lexical, and that is the right walk here: every component of
-     * /dev/bus this layer serves is a plain directory it materialized itself,
-     * so there is no symlink for a kernel-order walk to resolve differently.
-     * The result is written into `norm`, which the /sys arm below would use for
-     * its own folded suffix -- the two never both run -- and classify_path's
+     * The result is written into norm, which the /sys arm below would use for
+     * its own folded suffix; the two never both run, and classify_path's
      * sys_suffix_out is only set on the /sys arm, so it keeps pointing into
      * live storage either way.
      *
@@ -1552,7 +1561,7 @@ static usb_path_kind_t classify_and_normalize(const char *path,
      */
     if (path_prefix_match(path, "/dev/bus", 8)) {
         char folded[LINUX_PATH_MAX];
-        int frc = usb_suffix_normalize(skip_slashes(path + 8), folded,
+        int frc = usb_suffix_normalize(skip_slashes(path + 8), true, folded,
                                        sizeof(folded), NULL);
         if (frc < 0) {
             *err_out = ENAMETOOLONG;
@@ -1574,7 +1583,7 @@ static usb_path_kind_t classify_and_normalize(const char *path,
         return USB_PATH_NONE; /* another bus's /dev/bus subtree; not ours */
     if (kind != USB_PATH_SYS)
         return kind;
-    int rc = usb_suffix_normalize(*sfx_out, norm, normsz, NULL);
+    int rc = usb_suffix_normalize(*sfx_out, false, norm, normsz, NULL);
     if (rc < 0) {
         *err_out = ENAMETOOLONG;
         return USB_PATH_NONE;
@@ -2318,6 +2327,14 @@ out:
     return rc;
 }
 
+bool usb_sysfs_names_node(const char *guest_path)
+{
+    int bus = 0, dev = 0;
+    const char *sfx = "";
+    return path_prefix_match(guest_path, "/dev/bus/usb", 12) &&
+           classify_path(guest_path, &bus, &dev, &sfx) == USB_PATH_DEV_NODE;
+}
+
 bool usb_sysfs_resolve_dev_climb(const char *guest_path,
                                  char *out,
                                  size_t outsz)
@@ -2329,8 +2346,8 @@ bool usb_sysfs_resolve_dev_climb(const char *guest_path,
     const char *rest = NULL;
     pthread_mutex_lock(&usb_lock);
     bool climbs = ensure_usb_tree() == 0 &&
-                  usb_suffix_normalize(skip_slashes(guest_path + 8), folded,
-                                       sizeof(folded), &rest) == 0 &&
+                  usb_suffix_normalize(skip_slashes(guest_path + 8), true,
+                                       folded, sizeof(folded), &rest) == 0 &&
                   rest;
     pthread_mutex_unlock(&usb_lock);
     if (!climbs)

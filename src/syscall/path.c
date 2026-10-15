@@ -631,9 +631,9 @@ int path_translate_at(guest_fd_t dirfd,
     /* Linux folds "//" runs and "." components in the one walk every path
      * syscall shares, so no filesystem is handed them. The intercepts match
      * literal prefixes, here and behind this function, so the name is folded
-     * here once rather than by each of them. A relative name needs nothing: the
-     * two resolvers above fold what they join, and what they decline goes to
-     * the host as written.
+     * here once rather than by each of them. A relative name needs nothing:
+     * what the two resolvers above join comes back absolute and is folded here,
+     * and what they decline goes to the host as written.
      */
     if (tx->guest_path[0] == '/' && path_has_foldable(tx->guest_path)) {
         char *folded =
@@ -1368,7 +1368,10 @@ static bool proc_path_fd_is_dir(const fd_entry_t *snap)
 }
 
 /* Rebuild @path against the guest directory @base as an absolute guest path,
- * folding its components.
+ * folding its components. Once the walk reaches a usbfs node the rest is joined
+ * as written from the slash after it: Linux applies '..' only to a directory,
+ * and the USB layer answers ENOTDIR for a '..', a name or a trailing slash
+ * after a node.
  *
  * Returns 0, or -1 with errno set to ENAMETOOLONG.
  */
@@ -1379,14 +1382,38 @@ static int path_rebuild_under(const char *base,
 {
     size_t marks[PROC_PATH_COMPONENTS_MAX];
     size_t depth;
+    char comp[LINUX_PATH_MAX];
+    const char *p = path;
+
     if (proc_seed_absolute_path(base, out, outsz, marks, ARRAY_SIZE(marks),
-                                &depth) < 0 ||
-        proc_apply_components(path, out, outsz, marks, ARRAY_SIZE(marks),
-                              &depth) < 0) {
-        errno = ENAMETOOLONG;
-        return -1;
+                                &depth) < 0)
+        goto toolong;
+    while (*p && !usb_sysfs_names_node(out)) {
+        p += strspn(p, "/");
+        size_t n = strcspn(p, "/");
+        if (n == 0)
+            break;
+        if (n >= sizeof(comp))
+            goto toolong;
+        memcpy(comp, p, n);
+        comp[n] = '\0';
+        if (proc_apply_components(comp, out, outsz, marks, ARRAY_SIZE(marks),
+                                  &depth) < 0)
+            goto toolong;
+        p += n;
+    }
+    if (*p) {
+        size_t len = strlen(out);
+        int n =
+            snprintf(out + len, outsz - len, "%s%s", *p == '/' ? "" : "/", p);
+        if (n < 0 || (size_t) n >= outsz - len)
+            goto toolong;
     }
     return 0;
+
+toolong:
+    errno = ENAMETOOLONG;
+    return -1;
 }
 
 int resolve_proc_dirfd_path(guest_fd_t dirfd,

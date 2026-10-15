@@ -4,9 +4,9 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * Code under test: src/runtime/usb-sysfs.c, plus the sysfs statfs arms in
- * src/syscall/fs-stat.c and the /dev/bus climb rewrite in path_translate_at
- * (src/syscall/path.c).
+ * Code under test: src/runtime/usb-sysfs.c, plus the sysfs and /dev/bus statfs
+ * arms in src/syscall/fs-stat.c, and path_rebuild_under and the /dev/bus climb
+ * rewrite in path_translate_at (src/syscall/path.c).
  *
  * Two halves. The first asserts what holds with no USB device attached at all:
  * SYSFS_MAGIC from statfs and fstatfs alike, the read-only open contract, and
@@ -1183,6 +1183,38 @@ static void check_dev_bus_names(void)
                 "readlink of the descriptor");
     if (fd >= 0)
         close(fd);
+
+    /* path_rebuild_under folds a relative name against a /dev/bus cwd or dirfd
+     * up to a usbfs node, so every other '..' is applied before any entry point
+     * or stamp sees the name.
+     */
+    TEST("getcwd after chdir(\"..\") from /dev/bus/usb/001 is /dev/bus/usb");
+    EXPECT_TRUE(chdir("/dev/bus/usb/001") == 0 && chdir("..") == 0 &&
+                    getcwd(cwd, sizeof(cwd)) && !strcmp(cwd, "/dev/bus/usb"),
+                "chdir(\"..\"), then getcwd");
+
+    TEST("open(\".\") in a /dev/bus/usb cwd names /dev/bus/usb");
+    fd = open(".", O_RDONLY | O_DIRECTORY);
+    EXPECT_TRUE(fd >= 0 && fd_names(fd, "/dev/bus/usb"),
+                "readlink of the descriptor");
+    if (fd >= 0)
+        close(fd);
+
+    if (chdir("/") != 0)
+        FAIL("chdir back to /");
+
+    TEST("a '..' chain from a /dev/bus/usb/001 dirfd names it");
+    int dfd = open("/dev/bus/usb/001", O_RDONLY | O_DIRECTORY);
+    fd = dfd < 0
+             ? -1
+             : openat(dfd, "../001/../001/../001/../001/../001/../001/../001",
+                      O_RDONLY | O_DIRECTORY);
+    EXPECT_TRUE(fd >= 0 && fd_names(fd, "/dev/bus/usb/001"),
+                "readlink of the descriptor");
+    if (fd >= 0)
+        close(fd);
+    if (dfd >= 0)
+        close(dfd);
 }
 
 /* Whether @a and @b describe the same file. */
@@ -1279,6 +1311,98 @@ static void check_dotdot_leaves_bus(void)
         FAIL("chdir back to /");
 }
 
+/* openat of @rel from the host directory @dir, which the host refuses and
+ * openat retries through the guest spelling: ENOTDIR when @enotdir, else a
+ * descriptor.
+ */
+static void check_hostdir_openat(const char *dir, const char *rel, bool enotdir)
+{
+    char what[96];
+    snprintf(what, sizeof(what), "openat(%s, \"%s\") %s", dir, rel,
+             enotdir ? "is ENOTDIR" : "opens");
+    TEST(what);
+    int hfd = open(dir, O_RDONLY | O_DIRECTORY);
+    if (hfd < 0) {
+        FAIL(dir);
+        return;
+    }
+    errno = 0;
+    int fd = openat(hfd, rel, O_RDONLY | O_DIRECTORY);
+    EXPECT_TRUE(enotdir ? fd < 0 && errno == ENOTDIR : fd >= 0, what);
+    if (fd >= 0)
+        close(fd);
+    close(hfd);
+}
+
+/* A '..' after a usbfs node is ENOTDIR however the name is reached; chdir and
+ * fchdir publish the cwd through different code.
+ */
+static void check_node_dotdot_relative(void)
+{
+    struct stat st;
+    struct statfs sfs;
+
+    TEST("a '..' after a node used as a directory is ENOTDIR");
+    EXPECT_ERRNO(stat("/dev/bus/usb/001/001/x/..", &st), ENOTDIR,
+                 "stat(\"/dev/bus/usb/001/001/x/..\")");
+
+    TEST("statfs through a usbfs node to /sys is ENOTDIR");
+    EXPECT_ERRNO(statfs("/dev/bus/usb/001/001/../../../../../sys", &sfs),
+                 ENOTDIR,
+                 "statfs(\"/dev/bus/usb/001/001/../../../../../sys\")");
+
+    int dfd = open("/dev/bus/usb/001", O_RDONLY | O_DIRECTORY);
+    TEST("\"001/..\" against a /dev/bus/usb/001 dirfd is ENOTDIR");
+    if (dfd < 0) {
+        FAIL("open /dev/bus/usb/001");
+        return;
+    }
+    EXPECT_ERRNO(fstatat(dfd, "001/..", &st, 0), ENOTDIR,
+                 "fstatat(/dev/bus/usb/001, \"001/..\")");
+
+    TEST("\"001/..\" in a /dev/bus/usb/001 cwd from chdir is ENOTDIR");
+    if (chdir("/dev/bus/usb/001") != 0)
+        FAIL("chdir /dev/bus/usb/001");
+    else
+        EXPECT_ERRNO(stat("001/..", &st), ENOTDIR, "stat(\"001/..\")");
+
+    TEST("\"001/..\" in a /dev/bus/usb/001 cwd from fchdir is ENOTDIR");
+    if (chdir("/") != 0 || fchdir(dfd) != 0)
+        FAIL("fchdir /dev/bus/usb/001");
+    else
+        EXPECT_ERRNO(stat("001/..", &st), ENOTDIR, "stat(\"001/..\")");
+    if (chdir("/") != 0)
+        FAIL("chdir back to /");
+
+    TEST("\"001/\" against a /dev/bus/usb/001 dirfd is ENOTDIR");
+    EXPECT_ERRNO(openat(dfd, "001/", O_RDWR), ENOTDIR,
+                 "openat(/dev/bus/usb/001, \"001/\", O_RDWR)");
+
+    /* Every other '..' is still applied before the layer sees the name, so
+     * usbdev_open_path, which takes only the canonical spelling, gets it.
+     */
+    TEST("\"../001/001\" against a /dev/bus/usb/001 dirfd opens read-write");
+    int fd = openat(dfd, "../001/001", O_RDWR);
+    EXPECT_TRUE(fd >= 0, "openat(/dev/bus/usb/001, \"../001/001\", O_RDWR)");
+    if (fd >= 0)
+        close(fd);
+
+    TEST("a climb from a /dev/bus/usb/001 dirfd reaches /sys");
+    fd = openat(dfd, "../../../../sys/bus/usb/devices", O_RDONLY | O_DIRECTORY);
+    EXPECT_TRUE(fd >= 0, "openat(/dev/bus/usb/001, \"../../../../sys/...\")");
+    if (fd >= 0)
+        close(fd);
+    close(dfd);
+
+    /* The retry folds the name up to the node, so the node is not folded away
+     * and a walk from / or out of /dev still reaches the layer.
+     */
+    check_hostdir_openat("/dev", "bus/usb/001/001/..", true);
+    check_hostdir_openat("/", "dev/bus/usb/001/001/..", true);
+    check_hostdir_openat("/dev", "../dev/bus/usb/001/001/..", true);
+    check_hostdir_openat("/", "dev/bus/usb/001", false);
+}
+
 int main(void)
 {
     printf("test-usb-sysfs: synthetic USB tree contract\n");
@@ -1288,6 +1412,7 @@ int main(void)
     int ndev = check_devices();
     check_dev_bus_names();
     check_dotdot_leaves_bus();
+    check_node_dotdot_relative();
 
     /* Stated, not implied: the second half is only as strong as the bus it ran
      * against, and a zero here means those assertions did not execute.

@@ -75,6 +75,11 @@ int usb_sysfs_resolve_guest_path(const char *guest_path,
                                  char *out,
                                  size_t outsz);
 
+/* Whether the folded guest name @guest_path is a usbfs node, by its shape
+ * alone; it takes no lock.
+ */
+bool usb_sysfs_names_node(const char *guest_path);
+
 /* Rewrite a /dev/bus name that climbs out of /dev/bus with '..', popping only
  * directories the layer serves, to /dev followed by what comes after the '..'
  * that climbed, or to /dev/. when nothing does. Those directories are the

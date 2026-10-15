@@ -669,6 +669,20 @@ static int64_t sys_statfs_impl(guest_t *g,
         }
     }
 
+    /* /dev/bus is asked first: a '..' after a usbfs node is ENOTDIR, before the
+     * lexical fold below can carry the name to /sys.
+     */
+    int dev_bus = statfs_dev_bus_class(name);
+    if (dev_bus == -1)
+        return linux_errno();
+    if (dev_bus == 0) {
+        linux_statfs_t lin_st;
+        fill_dev_statfs(&lin_st);
+        if (guest_write_small(g, buf_gva, &lin_st, sizeof(lin_st)) < 0)
+            return -LINUX_EFAULT;
+        return 0;
+    }
+
     /* /sys is sysfs. libusb refuses to enumerate through the synthetic
      * /sys/bus/usb tree unless statfs("/sys") reports SYSFS_MAGIC
      * (linux_usbfs.c:398-408), and passing through to the host either fails (no
@@ -705,17 +719,6 @@ static int64_t sys_statfs_impl(guest_t *g,
             return -LINUX_ENOENT;
         linux_statfs_t lin_st;
         fill_sysfs_statfs(&lin_st);
-        if (guest_write_small(g, buf_gva, &lin_st, sizeof(lin_st)) < 0)
-            return -LINUX_EFAULT;
-        return 0;
-    }
-
-    int dev_bus = statfs_dev_bus_class(name);
-    if (dev_bus == -1)
-        return linux_errno();
-    if (dev_bus == 0) {
-        linux_statfs_t lin_st;
-        fill_dev_statfs(&lin_st);
         if (guest_write_small(g, buf_gva, &lin_st, sizeof(lin_st)) < 0)
             return -LINUX_EFAULT;
         return 0;

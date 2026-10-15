@@ -99,6 +99,7 @@ enum {
     COL_SYS_FOLD_IN, /* a '..' out of a backing /sys name and back into ours */
     COL_CLIMB,       /* a '..' out of /dev/bus over its own directories */
     COL_CLIMB_FILE,  /* a '..' out of /dev/bus after the backing's file */
+    COL_NODE_DOTDOT, /* the usb node followed by '..' */
     COL_COUNT,
 };
 
@@ -106,7 +107,7 @@ static const char *col_name[COL_COUNT] = {
     "synth-dir",   "back-sys",  "back-dev",    "subsys",       "escape",
     "escape-syn",  "usb-node",  "absent",      "long-sys",     "sys-root",
     "dev-bus",     "shadow",    "subsys-out",  "dev-fold-out", "dev-fold-in",
-    "sys-fold-in", "dev-climb", "dev-climb-f",
+    "sys-fold-in", "dev-climb", "dev-climb-f", "node-dotdot",
 };
 
 /* COL_SUBSYS is the one spelling that cannot be shared: the recording host's
@@ -178,6 +179,8 @@ static const char *col_path(int c)
         return "/dev/bus/usb/001/../../..";
     case COL_CLIMB_FILE:
         return "/dev/bus/other/f/../../../null";
+    case COL_NODE_DOTDOT:
+        return "/dev/bus/usb/001/001/..";
     default:
         return "/dev/bus";
     }
@@ -214,19 +217,21 @@ static const char *col_path(int c)
 
 /* COL_SYS_FOLD_IN is the /sys mirror of COL_FOLD_IN, and the one direction that
  * stays unmet. /sys/class/../bus/usb/devices folds to a name this layer owns
- * and serves, and ownership is decided on that folded name -- but the resolve
+ * and serves, and ownership is decided on that folded name, but the resolve
  * behind it joins the unfolded suffix onto the scratch tree, which carries no
- * `class`, so the lookup fails and the layer answers its own authoritative
- * ENOENT for a directory it does serve. Recorded as XFAIL rather than repaired:
- * it is not this series\' doing, and the vectors header carries the measurement
- * against the merge base and the reason a fold cannot fix this half the way it
- * fixed the /dev one.
+ * class, so the lookup fails and the layer answers its own authoritative ENOENT
+ * for a directory it does serve. It is an XFAIL; the vectors header says why a
+ * fold cannot fix this half the way it fixes the /dev one.
  */
 
 /* COL_CLIMB leaves /dev/bus through directories the layer serves and lands on
  * /dev; its dirfd rows take the last '..' from a descriptor on /dev/bus.
  * COL_CLIMB_FILE leaves after COL_BACK_DEV's regular file, which Linux answers
  * ENOTDIR for, so a rewrite that trusts the lexical fold alone fails it.
+ */
+
+/* COL_NODE_DOTDOT puts a '..' after COL_NODE's character device, which Linux
+ * answers ENOTDIR for and a lexical fold would turn into the bus directory.
  */
 
 /* Names that must be listed by the union directories, one comma-free name per
