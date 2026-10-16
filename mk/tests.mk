@@ -732,18 +732,22 @@ test-absock-cleanup: $(ELFUSE_BIN) $(BUILD_DIR)/test-absock-cleanup
 # pid to another elfuse process. The recipe plants such a record, host pid of
 # a live unrelated elfuse run with a start time it does not have, and the
 # family's kill(99, 0) must still fail with ESRCH.
+# Concurrent runners share the directory and a stale registry can carry a
+# reused pid, so select the registry that is new since the recipe started and
+# holds records for the family root and one of its children.
 ## registry ignores a reused host pid, and is not named after one
 test-registry-stale-pid: $(ELFUSE_BIN) $(BUILD_DIR)/test-registry-stale-pid
 	@tmp=$$(mktemp -d); xpid=; fpid=; \
 	trap 'kill $$xpid $$fpid 2>/dev/null; rm -rf "$$tmp"' EXIT; \
 	fail() { printf "FAIL: %s\n" "$$1"; exit 1; }; \
+	regs() { (cd "$$dir" && ls) | grep '^elfuse-procs-' | sort; }; \
 	printf "  %-30s " "stale record on reused pid"; \
 	tmo=$$(command -v timeout 2>/dev/null \
 	    || command -v gtimeout 2>/dev/null || true); \
 	[ -n "$$tmo" ] || { printf "SKIP (timeout(1) missing)\n"; exit 0; }; \
 	secs=$${TEST_TIMEOUT:-10}; \
 	dir=$$(getconf DARWIN_USER_TEMP_DIR); \
-	ls "$$dir" | grep '^elfuse-procs-' | sort > "$$tmp/before" || true; \
+	regs > "$$tmp/before" || true; \
 	mkfifo "$$tmp/go"; \
 	$$tmo "$$secs" $(ELFUSE_BIN) $(BUILD_DIR)/test-registry-stale-pid hold & \
 	xpid=$$!; \
@@ -751,18 +755,20 @@ test-registry-stale-pid: $(ELFUSE_BIN) $(BUILD_DIR)/test-registry-stale-pid
 	    < "$$tmp/go" > "$$tmp/out" & \
 	fpid=$$!; \
 	exec 4> "$$tmp/go"; \
-	for i in $$(seq 1 50); do \
+	for i in $$(seq 1 $$((secs > 0 ? secs * 10 : 50))); do \
 		grep -q READY "$$tmp/out" && break; \
 		sleep 0.1; \
 	done; \
 	grep -q READY "$$tmp/out" || fail "family never reported READY"; \
-	new=$$(ls "$$dir" | grep '^elfuse-procs-' | sort \
-	    | comm -13 "$$tmp/before" -); \
-	[ "$$(printf '%s\n' "$$new" | grep -c .)" = 1 ] \
-	    || fail "expected one new registry in $$dir, saw '$$new'"; \
-	reg="$$dir$$new"; \
 	root=$$(pgrep -P "$$fpid" | head -1); \
 	[ -n "$$root" ] || fail "family root process not found"; \
+	kids=$$(pgrep -P "$$root" | paste -sd'|' -); \
+	[ -n "$$kids" ] || fail "family child process not found"; \
+	new=$$(regs | comm -13 "$$tmp/before" - | (cd "$$dir" \
+	    && xargs grep -ls "^$$root " | xargs grep -lsE "^($$kids) ")); \
+	[ "$$(printf '%s\n' "$$new" | grep -c .)" = 1 ] \
+	    || fail "expected one registry for host pids $$root/$$kids, saw '$$new'"; \
+	reg="$$dir$$new"; \
 	[ "$$new" != "elfuse-procs-$$root" ] \
 	    || fail "family id is the root pid $$root, which macOS recycles"; \
 	holder=$$(pgrep -P "$$xpid" | head -1); \
