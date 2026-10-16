@@ -392,6 +392,16 @@ static futex_bucket_t *futex_waiter_follow(futex_bucket_t *b,
     }
 }
 
+/* Whether any waiter on @uaddr is queued in @b. Caller must hold b->lock. */
+static bool bucket_has_uaddr_locked(const futex_bucket_t *b, uint64_t uaddr)
+{
+    for (const futex_waiter_t *w = b->head; w; w = w->next) {
+        if (w->uaddr == uaddr)
+            return true;
+    }
+    return false;
+}
+
 /* Unlink the waiter at *pp from its bucket list and wake it. The bucket lock
  * must be held. Unlinking before the store/signal keeps a woken waiter from
  * observing itself still queued; the release store pairs with the waiter's
@@ -1547,44 +1557,62 @@ static int64_t futex_lock_pi_inner(guest_t *g,
         if (owner_tid != 0 && !thread_find((int64_t) owner_tid))
             return -LINUX_ESRCH;
 
-        /* Set the WAITERS bit so the owner takes the kernel-mediated unlock
-         * path. Retry the CAS in a loop since the owner may release
-         * concurrently.
+        /* Set FUTEX_WAITERS and enqueue under one hold of the bucket lock.
+         *
+         * The bit is what makes the owner release through FUTEX_UNLOCK_PI: its
+         * guest-side CAS(TID->0) fails while the bit is set. Parking on an
+         * owned word without it is therefore a lost wake, since that CAS
+         * succeeds and makes no syscall. Setting the bit before taking the
+         * lock, and then only checking that the word was still owned, allowed
+         * exactly that: the owner could release and retake the lock in guest
+         * code in between, and the word read as owned with the bit gone.
+         *
+         * Under the lock the two cannot come apart. Once the word is seen (or
+         * made) owned with the bit set, the owner can only release through
+         * FUTEX_UNLOCK_PI, which takes this bucket lock after its release and
+         * so finds the waiter enqueued below.
          */
-        for (;;) {
-            uint32_t cur;
-            if (!futex_word_load(word, &cur))
-                return -LINUX_EFAULT;
-            if (futex_pi_unowned(cur))
-                break; /* Owner released; retry outer loop */
-            if (futex_pi_has_waiters(cur))
-                break; /* Already set by another waiter */
-            uint32_t desired = futex_pi_set_waiters(cur);
-            bool marked;
-            if (!futex_word_cas(word, &cur, desired, &marked))
-                return -LINUX_EFAULT;
-            if (marked)
-                break; /* WAITERS bit set */
-        }
-
-        /* Re-check after WAITERS bit: if lock is now free, retry */
-        uint32_t cur;
-        if (!futex_word_load(word, &cur))
-            return -LINUX_EFAULT;
-        if (futex_pi_unowned(cur))
-            continue;
-
-        /* Enqueue and block */
         pthread_mutex_lock(&b->lock);
 
-        /* Double-check under bucket lock: owner may have released and called
-         * UNLOCK_PI between the current WAITERS set and lock.
-         */
-        if (!futex_word_load(word, &cur)) {
-            pthread_mutex_unlock(&b->lock);
-            return -LINUX_EFAULT;
+        uint32_t cur;
+        for (;;) {
+            if (!futex_word_load(word, &cur)) {
+                pthread_mutex_unlock(&b->lock);
+                return -LINUX_EFAULT;
+            }
+            if (futex_pi_unowned(cur) || futex_pi_has_waiters(cur))
+                break;
+            bool marked;
+            if (!futex_word_cas(word, &cur, futex_pi_set_waiters(cur),
+                                &marked)) {
+                pthread_mutex_unlock(&b->lock);
+                return -LINUX_EFAULT;
+            }
+            if (marked)
+                break;
         }
+
         if (futex_pi_unowned(cur)) {
+            /* FUTEX_WAITERS with no TID never matches the fast path's
+             * CAS(0->TID), so take the word here, as futex_lock_pi_atomic does
+             * on Linux. The bit stays while another waiter is queued.
+             * FUTEX_OWNER_DIED is left to the recovery at the top.
+             */
+            if (cur != 0 && !futex_pi_owner_died(cur)) {
+                uint32_t want = tid;
+                if (bucket_has_uaddr_locked(b, uaddr))
+                    want = futex_pi_set_waiters(tid);
+                bool taken;
+                if (!futex_word_cas(word, &cur, want, &taken)) {
+                    pthread_mutex_unlock(&b->lock);
+                    return -LINUX_EFAULT;
+                }
+                if (taken) {
+                    pthread_mutex_unlock(&b->lock);
+                    return 0;
+                }
+            }
+            /* Owner released first, or the word moved: retry. */
             pthread_mutex_unlock(&b->lock);
             continue;
         }
@@ -1656,18 +1684,14 @@ static int64_t futex_lock_pi_inner(guest_t *g,
                                                  memory_order_acquire)) {
                     /* Timeout: dequeue and return */
                     bucket_unlink_locked(b, &waiter);
-                    /* Only clear WAITERS bit if no waiters for this address */
-                    bool has_waiters = false;
-                    for (futex_waiter_t *w = b->head; w; w = w->next) {
-                        if (w->uaddr == uaddr) {
-                            has_waiters = true;
-                            break;
-                        }
-                    }
+
+                    /* Clear under the lock: a waiter that enqueues once it is
+                     * dropped relies on the bit it reads staying set.
+                     */
+                    if (!bucket_has_uaddr_locked(b, uaddr))
+                        futex_clear_waiters_bit(word);
                     pthread_mutex_unlock(&b->lock);
                     pthread_cond_destroy(&waiter.cond);
-                    if (!has_waiters)
-                        futex_clear_waiters_bit(word);
                     return -LINUX_ETIMEDOUT;
                 }
             } else {
