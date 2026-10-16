@@ -400,15 +400,32 @@ int rseq_try_abort(guest_t *g,
     return result;
 }
 
-static bool process_pid_sequence_path(char *out, size_t out_size)
+/* Build "<dir>elfuse-<stem>-<id>" in the per-user private temp directory macOS
+ * provisions (mode 0700, owned by the invoking uid) rather than world-writable
+ * /tmp, so another local user cannot pre-plant a symlink or forge a file's
+ * contents. confstr returns the same directory for every process of this uid,
+ * so every family member agrees on the path. Callers open the result O_NOFOLLOW
+ * for defense in depth.
+ *
+ * Returns false (fail closed) if the directory cannot be resolved or the path
+ * does not fit.
+ */
+static bool private_tmp_path(char *out,
+                             size_t out_size,
+                             const char *stem,
+                             unsigned long long id)
 {
     char dir[PATH_MAX];
     size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof(dir));
     if (n == 0 || n > sizeof(dir))
         return false;
-    int len = snprintf(out, out_size, "%selfuse-pidseq-%llu", dir,
-                       (unsigned long long) absock_get_namespace_id());
+    int len = snprintf(out, out_size, "%selfuse-%s-%llu", dir, stem, id);
     return len > 0 && (size_t) len < out_size;
+}
+
+static bool process_pid_sequence_path(char *out, size_t out_size)
+{
+    return private_tmp_path(out, out_size, "pidseq", absock_get_namespace_id());
 }
 
 int64_t proc_alloc_pid(void)
@@ -587,36 +604,16 @@ pid_t proc_guest_to_host_pid(int64_t gpid)
     return result;
 }
 
-/* Build the path to the cross-process signal-transport file for @host_pid.
- *
- * Files live in the per-user private temp directory macOS provisions (mode
- * 0700, owned by the invoking uid) rather than world-writable /tmp, so another
- * local user cannot pre-plant a symlink to redirect the write or inject signal
- * numbers into the guest. confstr returns the same directory for every process
- * of this uid, so sender and receiver agree on the path. Callers open the
- * result O_NOFOLLOW for defense in depth.
- *
- * Returns false (fail closed) if the private directory cannot be resolved.
- */
+/* Cross-process signal-transport file for @host_pid, a live process. */
 static bool signal_transport_path(char *out, size_t out_size, pid_t host_pid)
 {
-    char dir[PATH_MAX];
-    size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof(dir));
-    if (n == 0 || n > sizeof(dir))
-        return false;
-    int len = snprintf(out, out_size, "%selfuse-sig-%ld", dir, (long) host_pid);
-    return len > 0 && (size_t) len < out_size;
+    return private_tmp_path(out, out_size, "sig",
+                            (unsigned long long) host_pid);
 }
 
 static bool process_registry_path(char *out, size_t out_size)
 {
-    char dir[PATH_MAX];
-    size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof(dir));
-    if (n == 0 || n > sizeof(dir))
-        return false;
-    int len = snprintf(out, out_size, "%selfuse-procs-%llu", dir,
-                       (unsigned long long) absock_get_namespace_id());
-    return len > 0 && (size_t) len < out_size;
+    return private_tmp_path(out, out_size, "procs", absock_get_namespace_id());
 }
 
 /* The process-group registry above intentionally contains only live host
@@ -654,13 +651,7 @@ typedef struct {
 
 static bool lifecycle_registry_path(char *out, size_t out_size)
 {
-    char dir[PATH_MAX];
-    size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof(dir));
-    if (n == 0 || n > sizeof(dir))
-        return false;
-    int len = snprintf(out, out_size, "%selfuse-life-%llu", dir,
-                       (unsigned long long) absock_get_namespace_id());
-    return len > 0 && (size_t) len < out_size;
+    return private_tmp_path(out, out_size, "life", absock_get_namespace_id());
 }
 
 static bool lifecycle_registry_size(uint32_t capacity, size_t *size_out)
