@@ -4,8 +4,9 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * Code under test: src/runtime/usb-sysfs.c, plus the sysfs statfs arms in
- * src/syscall/fs-stat.c.
+ * Code under test: src/runtime/usb-sysfs.c, plus the sysfs and /dev/bus statfs
+ * arms in src/syscall/fs-stat.c, and path_rebuild_under and the /dev/bus climb
+ * rewrite in path_translate_at (src/syscall/path.c).
  *
  * Two halves. The first asserts what holds with no USB device attached at all:
  * SYSFS_MAGIC from statfs and fstatfs alike, the read-only open contract, and
@@ -21,6 +22,9 @@
  * `subsystem` links the tree emits are reachable the way Linux makes them
  * reachable: followed on a plain open, ELOOP only when the caller asked for
  * O_NOFOLLOW, and readable as a target either way.
+ *
+ * The /dev/bus name checks at the end use the fixture's devices, which the lane
+ * always provides.
  *
  * A run with no devices is not a pass by default: the device count is printed,
  * so a lane that quietly stopped covering the second half is visible rather
@@ -1147,6 +1151,280 @@ static int check_devices(void)
     return ndev;
 }
 
+/* Whether /proc/self/fd/@fd reads back as @want. */
+static bool fd_names(int fd, const char *want)
+{
+    char link[32], buf[128];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, buf, sizeof(buf) - 1);
+    if (n < 0)
+        return false;
+    buf[n] = '\0';
+    return !strcmp(buf, want);
+}
+
+/* A /dev/bus directory reached through '..' is named by the directory in getcwd
+ * and in /proc/self/fd, as Linux names it, not by the spelling.
+ */
+static void check_dev_bus_names(void)
+{
+    char cwd[64];
+
+    TEST("getcwd after chdir /dev/bus/usb/001/.. is /dev/bus/usb");
+    EXPECT_TRUE(chdir("/dev/bus/usb/001/..") == 0 && getcwd(cwd, sizeof(cwd)) &&
+                    !strcmp(cwd, "/dev/bus/usb"),
+                "chdir(\"/dev/bus/usb/001/..\"), then getcwd");
+    if (chdir("/") != 0)
+        FAIL("chdir back to /");
+
+    TEST("/dev/bus/usb/001/../001/ opens as /dev/bus/usb/001");
+    int fd = open("/dev/bus/usb/001/../001/", O_RDONLY | O_DIRECTORY);
+    EXPECT_TRUE(fd >= 0 && fd_names(fd, "/dev/bus/usb/001"),
+                "readlink of the descriptor");
+    if (fd >= 0)
+        close(fd);
+
+    /* path_rebuild_under folds a relative name against a /dev/bus cwd or dirfd
+     * up to a usbfs node, so every other '..' is applied before any entry point
+     * or stamp sees the name.
+     */
+    TEST("getcwd after chdir(\"..\") from /dev/bus/usb/001 is /dev/bus/usb");
+    EXPECT_TRUE(chdir("/dev/bus/usb/001") == 0 && chdir("..") == 0 &&
+                    getcwd(cwd, sizeof(cwd)) && !strcmp(cwd, "/dev/bus/usb"),
+                "chdir(\"..\"), then getcwd");
+
+    TEST("open(\".\") in a /dev/bus/usb cwd names /dev/bus/usb");
+    fd = open(".", O_RDONLY | O_DIRECTORY);
+    EXPECT_TRUE(fd >= 0 && fd_names(fd, "/dev/bus/usb"),
+                "readlink of the descriptor");
+    if (fd >= 0)
+        close(fd);
+
+    if (chdir("/") != 0)
+        FAIL("chdir back to /");
+
+    TEST("a '..' chain from a /dev/bus/usb/001 dirfd names it");
+    int dfd = open("/dev/bus/usb/001", O_RDONLY | O_DIRECTORY);
+    fd = dfd < 0
+             ? -1
+             : openat(dfd, "../001/../001/../001/../001/../001/../001/../001",
+                      O_RDONLY | O_DIRECTORY);
+    EXPECT_TRUE(fd >= 0 && fd_names(fd, "/dev/bus/usb/001"),
+                "readlink of the descriptor");
+    if (fd >= 0)
+        close(fd);
+    if (dfd >= 0)
+        close(dfd);
+}
+
+/* Whether @a and @b describe the same file. */
+static bool same_inode(const struct stat *a, const struct stat *b)
+{
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
+}
+
+/* Whether @path names the same file as @want. */
+static bool same_file(const char *path, const struct stat *want)
+{
+    struct stat st;
+    return stat(path, &st) == 0 && same_inode(&st, want);
+}
+
+/* A '..' out of /dev/bus lands in /dev however the name is reached, and a
+ * further '..' climbs on from there.
+ */
+static void check_dotdot_leaves_bus(void)
+{
+    static const char *const nulls[] = {
+        "/dev/bus/../null",           "/dev/bus/../bus/../null",
+        "/dev/bus/.././bus/../null",  "/dev/bus/../../dev/null",
+        "/dev/bus/../../../dev/null", "/dev/bus/../../dev/bus/../null",
+    };
+    static const char *const climbs[][2] = {
+        {"/dev/bus/usb/001/../../..", "/dev"},
+        {"/dev/bus/../..", "/"},
+        {"/dev/bus/../../dev/bus/usb", "/dev/bus/usb"},
+        {"/dev/bus/usb/001/../../../../sys/bus/usb/devices",
+         "/sys/bus/usb/devices"},
+        {"/dev/bus/../../proc/self/status", "/proc/self/status"},
+        {"/dev/bus/../../../proc/self/status", "/proc/self/status"},
+    };
+    struct stat dev_st, null_st, st;
+    char what[96], cwd[64];
+
+    TEST("/dev and /dev/null are stat-able");
+    if (stat("/dev", &dev_st) != 0 || stat("/dev/null", &null_st) != 0) {
+        FAIL("stat");
+        return;
+    }
+    PASS();
+
+    for (size_t i = 0; i < sizeof(nulls) / sizeof(nulls[0]); i++) {
+        snprintf(what, sizeof(what), "%s is /dev/null", nulls[i]);
+        TEST(what);
+        EXPECT_TRUE(same_file(nulls[i], &null_st), nulls[i]);
+    }
+
+    TEST("/dev/bus/.. is /dev");
+    EXPECT_TRUE(same_file("/dev/bus/..", &dev_st), "stat(\"/dev/bus/..\")");
+
+    for (size_t i = 0; i < sizeof(climbs) / sizeof(climbs[0]); i++) {
+        snprintf(what, sizeof(what), "%s is %s", climbs[i][0], climbs[i][1]);
+        TEST(what);
+        EXPECT_TRUE(
+            stat(climbs[i][1], &st) == 0 && same_file(climbs[i][0], &st),
+            climbs[i][0]);
+    }
+
+    TEST("a '..' out through a bus no device has is ENOENT");
+    EXPECT_ERRNO(stat("/dev/bus/usb/099/../../../null", &st), ENOENT,
+                 "stat(\"/dev/bus/usb/099/../../../null\")");
+
+    TEST("../null against a /dev/bus dirfd is /dev/null");
+    int dfd = open("/dev/bus", O_RDONLY | O_DIRECTORY);
+    EXPECT_TRUE(dfd >= 0 && fstatat(dfd, "../null", &st, 0) == 0 &&
+                    same_inode(&st, &null_st),
+                "fstatat(/dev/bus, \"../null\")");
+    if (dfd >= 0)
+        close(dfd);
+
+    TEST("chdir .. from /dev/bus reaches /dev");
+    if (chdir("/dev/bus") != 0 || chdir("..") != 0)
+        FAIL("chdir /dev/bus, then ..");
+    else if (!getcwd(cwd, sizeof(cwd)) || strcmp(cwd, "/dev"))
+        FAIL("getcwd after chdir ..");
+    else if (!same_file("null", &null_st))
+        FAIL("stat(\"null\") in /dev");
+    else
+        PASS();
+    if (chdir("/") != 0)
+        FAIL("chdir back to /");
+
+    TEST("chdir /dev/bus/usb/001/../../.. reaches /dev");
+    if (chdir("/dev/bus/usb/001/../../..") != 0)
+        FAIL("chdir /dev/bus/usb/001/../../..");
+    else if (!getcwd(cwd, sizeof(cwd)) || strcmp(cwd, "/dev"))
+        FAIL("getcwd after chdir /dev/bus/usb/001/../../..");
+    else
+        PASS();
+    if (chdir("/") != 0)
+        FAIL("chdir back to /");
+}
+
+/* openat of @rel from the host directory @dir, which the host refuses and
+ * openat retries through the guest spelling: ENOTDIR when @enotdir, else a
+ * descriptor.
+ */
+static void check_hostdir_openat(const char *dir, const char *rel, bool enotdir)
+{
+    char what[96];
+    snprintf(what, sizeof(what), "openat(%s, \"%s\") %s", dir, rel,
+             enotdir ? "is ENOTDIR" : "opens");
+    TEST(what);
+    int hfd = open(dir, O_RDONLY | O_DIRECTORY);
+    if (hfd < 0) {
+        FAIL(dir);
+        return;
+    }
+    errno = 0;
+    int fd = openat(hfd, rel, O_RDONLY | O_DIRECTORY);
+    EXPECT_TRUE(enotdir ? fd < 0 && errno == ENOTDIR : fd >= 0, what);
+    if (fd >= 0)
+        close(fd);
+    close(hfd);
+}
+
+/* A '..' after a usbfs node is ENOTDIR however the name is reached, and a node
+ * reached through any other '..' opens as itself; chdir and fchdir publish the
+ * cwd through different code.
+ */
+static void check_node_dotdot_relative(void)
+{
+    struct stat st;
+    struct statfs sfs;
+
+    TEST("a '..' after a node used as a directory is ENOTDIR");
+    EXPECT_ERRNO(stat("/dev/bus/usb/001/001/x/..", &st), ENOTDIR,
+                 "stat(\"/dev/bus/usb/001/001/x/..\")");
+
+    TEST("statfs through a usbfs node to /sys is ENOTDIR");
+    EXPECT_ERRNO(statfs("/dev/bus/usb/001/001/../../../../../sys", &sfs),
+                 ENOTDIR,
+                 "statfs(\"/dev/bus/usb/001/001/../../../../../sys\")");
+
+    int dfd = open("/dev/bus/usb/001", O_RDONLY | O_DIRECTORY);
+    TEST("\"001/..\" against a /dev/bus/usb/001 dirfd is ENOTDIR");
+    if (dfd < 0) {
+        FAIL("open /dev/bus/usb/001");
+        return;
+    }
+    EXPECT_ERRNO(fstatat(dfd, "001/..", &st, 0), ENOTDIR,
+                 "fstatat(/dev/bus/usb/001, \"001/..\")");
+
+    TEST("\"001/..\" in a /dev/bus/usb/001 cwd from chdir is ENOTDIR");
+    if (chdir("/dev/bus/usb/001") != 0)
+        FAIL("chdir /dev/bus/usb/001");
+    else
+        EXPECT_ERRNO(stat("001/..", &st), ENOTDIR, "stat(\"001/..\")");
+
+    TEST("\"001/..\" in a /dev/bus/usb/001 cwd from fchdir is ENOTDIR");
+    if (chdir("/") != 0 || fchdir(dfd) != 0)
+        FAIL("fchdir /dev/bus/usb/001");
+    else
+        EXPECT_ERRNO(stat("001/..", &st), ENOTDIR, "stat(\"001/..\")");
+    if (chdir("/") != 0)
+        FAIL("chdir back to /");
+
+    TEST("\"001/\" against a /dev/bus/usb/001 dirfd is ENOTDIR");
+    EXPECT_ERRNO(openat(dfd, "001/", O_RDWR), ENOTDIR,
+                 "openat(/dev/bus/usb/001, \"001/\", O_RDWR)");
+
+    /* Every other '..' is still applied before the layer sees the name, so
+     * usbdev_open_path, which takes only the canonical spelling, gets it.
+     */
+    TEST("\"../001/001\" against a /dev/bus/usb/001 dirfd opens read-write");
+    int fd = openat(dfd, "../001/001", O_RDWR);
+    EXPECT_TRUE(fd >= 0, "openat(/dev/bus/usb/001, \"../001/001\", O_RDWR)");
+    if (fd >= 0)
+        close(fd);
+
+    /* An absolute name keeps its '..' through path translation, so
+     * sys_openat_path folds it for usbdev_open_path.
+     */
+    TEST("/dev/bus/usb/001/../001/001 opens read-write as the node");
+    fd = open("/dev/bus/usb/001/../001/001", O_RDWR);
+    EXPECT_TRUE(fd >= 0 && fd_names(fd, "/dev/bus/usb/001/001"),
+                "open(\"/dev/bus/usb/001/../001/001\", O_RDWR)");
+    if (fd >= 0)
+        close(fd);
+
+    TEST("an O_PATH open through '..' is named as the node");
+    fd = open("/dev/bus/usb/001/../001/001", O_PATH);
+    EXPECT_TRUE(fd >= 0 && fd_names(fd, "/dev/bus/usb/001/001"),
+                "open(\"/dev/bus/usb/001/../001/001\", O_PATH)");
+    if (fd >= 0)
+        close(fd);
+
+    TEST("/dev/bus/usb/001/../001/001/. is ENOTDIR");
+    EXPECT_ERRNO(open("/dev/bus/usb/001/../001/001/.", O_RDWR), ENOTDIR,
+                 "open(\"/dev/bus/usb/001/../001/001/.\", O_RDWR)");
+
+    TEST("a climb from a /dev/bus/usb/001 dirfd reaches /sys");
+    fd = openat(dfd, "../../../../sys/bus/usb/devices", O_RDONLY | O_DIRECTORY);
+    EXPECT_TRUE(fd >= 0, "openat(/dev/bus/usb/001, \"../../../../sys/...\")");
+    if (fd >= 0)
+        close(fd);
+    close(dfd);
+
+    /* The retry folds the name up to the node, so the node is not folded away
+     * and a walk from / or out of /dev still reaches the layer.
+     */
+    check_hostdir_openat("/dev", "bus/usb/001/001/..", true);
+    check_hostdir_openat("/", "dev/bus/usb/001/001/..", true);
+    check_hostdir_openat("/dev", "../dev/bus/usb/001/001/..", true);
+    check_hostdir_openat("/", "dev/bus/usb/001", false);
+}
+
 int main(void)
 {
     printf("test-usb-sysfs: synthetic USB tree contract\n");
@@ -1154,6 +1432,9 @@ int main(void)
     check_tree_contract();
     check_slurp_reads_whole_files();
     int ndev = check_devices();
+    check_dev_bus_names();
+    check_dotdot_leaves_bus();
+    check_node_dotdot_relative();
 
     /* Stated, not implied: the second half is only as strong as the bus it ran
      * against, and a zero here means those assertions did not execute.

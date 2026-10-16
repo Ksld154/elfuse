@@ -631,9 +631,9 @@ int path_translate_at(guest_fd_t dirfd,
     /* Linux folds "//" runs and "." components in the one walk every path
      * syscall shares, so no filesystem is handed them. The intercepts match
      * literal prefixes, here and behind this function, so the name is folded
-     * here once rather than by each of them. A relative name needs nothing: the
-     * two resolvers above fold what they join, and what they decline goes to
-     * the host as written.
+     * here once rather than by each of them. A relative name needs nothing:
+     * what the two resolvers above join comes back absolute and is folded here,
+     * and what they decline goes to the host as written.
      */
     if (tx->guest_path[0] == '/' && path_has_foldable(tx->guest_path)) {
         char *folded =
@@ -644,6 +644,21 @@ int path_translate_at(guest_fd_t dirfd,
             tx->guest_path = folded;
             tx->intercept_path = folded;
         }
+    }
+
+    /* usb_sysfs_resolve_dev_climb rewrites a /dev/bus name whose '..' climbs
+     * out of it. What follows can climb out again, as in
+     * /dev/bus/../bus/../null, and each pass shortens the name. A climb can
+     * land in /sys, so this runs before the /sys rewrite below.
+     */
+    while (path_prefix_match(tx->guest_path, "/dev/bus", 8)) {
+        char resolved[LINUX_PATH_MAX];
+        if (!usb_sysfs_resolve_dev_climb(tx->guest_path, resolved,
+                                         sizeof(resolved)))
+            break;
+        str_copy_trunc(tx->guest_buf, resolved, sizeof(tx->guest_buf));
+        tx->guest_path = tx->guest_buf;
+        tx->intercept_path = tx->guest_buf;
     }
 
     /* A /sys walk that passes through one of the synthetic USB `subsystem`
@@ -1352,6 +1367,55 @@ static bool proc_path_fd_is_dir(const fd_entry_t *snap)
     return true;
 }
 
+/* Rebuild @path against the guest directory @base as an absolute guest path,
+ * folding its components. Once the walk reaches a usbfs node the rest is joined
+ * as written from the slash after it: Linux applies '..' only to a directory,
+ * and the USB layer answers ENOTDIR for a '..', a name or a trailing slash
+ * after a node.
+ *
+ * Returns 0, or -1 with errno set to ENAMETOOLONG.
+ */
+static int path_rebuild_under(const char *base,
+                              const char *path,
+                              char *out,
+                              size_t outsz)
+{
+    size_t marks[PROC_PATH_COMPONENTS_MAX];
+    size_t depth;
+    char comp[LINUX_PATH_MAX];
+    const char *p = path;
+
+    if (proc_seed_absolute_path(base, out, outsz, marks, ARRAY_SIZE(marks),
+                                &depth) < 0)
+        goto toolong;
+    while (*p && !usb_sysfs_names_node(out)) {
+        p += strspn(p, "/");
+        size_t n = strcspn(p, "/");
+        if (n == 0)
+            break;
+        if (n >= sizeof(comp))
+            goto toolong;
+        memcpy(comp, p, n);
+        comp[n] = '\0';
+        if (proc_apply_components(comp, out, outsz, marks, ARRAY_SIZE(marks),
+                                  &depth) < 0)
+            goto toolong;
+        p += n;
+    }
+    if (*p) {
+        size_t len = strlen(out);
+        int n =
+            snprintf(out + len, outsz - len, "%s%s", *p == '/' ? "" : "/", p);
+        if (n < 0 || (size_t) n >= outsz - len)
+            goto toolong;
+    }
+    return 0;
+
+toolong:
+    errno = ENAMETOOLONG;
+    return -1;
+}
+
 int resolve_proc_dirfd_path(guest_fd_t dirfd,
                             const char *path,
                             char *out,
@@ -1387,16 +1451,8 @@ int resolve_proc_dirfd_path(guest_fd_t dirfd,
         return -1;
     }
 
-    size_t marks[PROC_PATH_COMPONENTS_MAX];
-    size_t depth;
-    if (proc_seed_absolute_path(snap.proc_path, out, outsz, marks,
-                                ARRAY_SIZE(marks), &depth) < 0 ||
-        proc_apply_components(path, out, outsz, marks, ARRAY_SIZE(marks),
-                              &depth) < 0) {
-        errno = ENAMETOOLONG;
+    if (path_rebuild_under(snap.proc_path, path, out, outsz) < 0)
         return -1;
-    }
-
     return 1;
 }
 
@@ -1414,24 +1470,12 @@ static int resolve_proc_cwd_path(const char *path, char *out, size_t outsz)
      * relative path measured against one has to be rebuilt as a guest path and
      * re-offered to the intercepts. Without the /sys and /dev/bus arms a cwd
      * set by fchdir() onto a synthetic USB directory would resolve relative
-     * names straight against the scratch tree. The component walk below is
-     * base-agnostic.
+     * names straight against the scratch tree.
      */
     int rc = 0;
     if (!strncmp(view.path, "/proc", 5) || !strncmp(view.path, "/dev/pts", 8) ||
-        !strncmp(view.path, "/sys", 4) || !strncmp(view.path, "/dev/bus", 8)) {
-        size_t marks[PROC_PATH_COMPONENTS_MAX];
-        size_t depth;
-        if (proc_seed_absolute_path(view.path, out, outsz, marks,
-                                    ARRAY_SIZE(marks), &depth) < 0 ||
-            proc_apply_components(path, out, outsz, marks, ARRAY_SIZE(marks),
-                                  &depth) < 0) {
-            errno = ENAMETOOLONG;
-            rc = -1;
-        } else {
-            rc = 1;
-        }
-    }
+        !strncmp(view.path, "/sys", 4) || !strncmp(view.path, "/dev/bus", 8))
+        rc = path_rebuild_under(view.path, path, out, outsz) < 0 ? -1 : 1;
 
     proc_release_cwd_view(&view);
     return rc;
@@ -1454,8 +1498,8 @@ int resolve_proc_at_path(guest_fd_t dirfd,
 
 /* Rebase a relative path against the host directory a descriptor points at,
  * producing the guest-visible absolute spelling: F_GETPATH names where the
- * directory lives on the host, path_host_to_guest strips the sysroot, and the
- * component walk folds "." and "..".
+ * directory lives on the host, path_host_to_guest strips the sysroot, and
+ * path_rebuild_under joins @rel to the result.
  *
  * This exists for relative walkers (systemd's chase() opens "/", then "sys",
  * then "bus", one openat per component) stepping from a host-backed directory
@@ -1498,14 +1542,7 @@ int path_rebase_hostdirfd(int host_dirfd,
     char guest_dir[LINUX_PATH_MAX];
     if (path_host_to_guest(host_dir, guest_dir, sizeof(guest_dir)) < 0)
         return 0;
-    size_t marks[PROC_PATH_COMPONENTS_MAX];
-    size_t depth;
-    if (proc_seed_absolute_path(guest_dir, out, outsz, marks, ARRAY_SIZE(marks),
-                                &depth) < 0 ||
-        proc_apply_components(rel, out, outsz, marks, ARRAY_SIZE(marks),
-                              &depth) < 0)
-        return 0;
-    return 1;
+    return path_rebuild_under(guest_dir, rel, out, outsz) < 0 ? 0 : 1;
 }
 
 bool path_openat2_stays_beneath(const char *path, bool clamp_at_root)

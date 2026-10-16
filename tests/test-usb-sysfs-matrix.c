@@ -6,8 +6,9 @@
  *
  * Code under test: the ours/not-ours decision in src/runtime/usb-sysfs.c
  * (classify_and_normalize + usb_resolve_or_disown), the getdents64 union in
- * src/syscall/fs.c, the access arm of sys_faccessat, and the fd-side sysfs
- * identity in sys_fstatfs (src/syscall/fs-stat.c).
+ * src/syscall/fs.c, the access arm of sys_faccessat, the fd-side sysfs identity
+ * in sys_fstatfs (src/syscall/fs-stat.c), and the /dev/bus climb rewrite in
+ * path_translate_at (src/syscall/path.c).
  *
  * The layer synthesizes exactly one subtree on each side, /sys/bus/usb and
  * /dev/bus/usb, on top of a backing /sys and /dev/bus that a sysroot supplies.
@@ -24,7 +25,7 @@
  *
  * EXPECTED VALUES ARE MEASURED, NOT ASSUMED. Every cell below was recorded by
  * running this same binary natively on Linux (docker gcc:14, aarch64, kernel
- * 6.x) with MATRIX_RECORD=1, over a /sys that is a real sysfs and a /dev/bus
+ * 7.0) with MATRIX_RECORD=1, over a /sys that is a real sysfs and a /dev/bus
  * carrying a mknod'd usb node next to a foreign bus directory. Re-record with:
  *
  *   docker run --rm -v "$PWD:/w" -w /w gcc:14 sh -c \
@@ -96,14 +97,17 @@ enum {
     COL_FOLD_OUT, /* a '..' out of /dev/bus/usb onto a name the backing owns */
     COL_FOLD_IN,  /* a '..' out of a foreign bus and back into /dev/bus/usb */
     COL_SYS_FOLD_IN, /* a '..' out of a backing /sys name and back into ours */
+    COL_CLIMB,       /* a '..' out of /dev/bus over its own directories */
+    COL_CLIMB_FILE,  /* a '..' out of /dev/bus after the backing's file */
+    COL_NODE_DOTDOT, /* the usb node followed by '..' */
     COL_COUNT,
 };
 
 static const char *col_name[COL_COUNT] = {
-    "synth-dir",  "back-sys",     "back-dev",    "subsys",
-    "escape",     "escape-syn",   "usb-node",    "absent",
-    "long-sys",   "sys-root",     "dev-bus",     "shadow",
-    "subsys-out", "dev-fold-out", "dev-fold-in", "sys-fold-in",
+    "synth-dir",   "back-sys",  "back-dev",    "subsys",       "escape",
+    "escape-syn",  "usb-node",  "absent",      "long-sys",     "sys-root",
+    "dev-bus",     "shadow",    "subsys-out",  "dev-fold-out", "dev-fold-in",
+    "sys-fold-in", "dev-climb", "dev-climb-f", "node-dotdot",
 };
 
 /* COL_SUBSYS is the one spelling that cannot be shared: the recording host's
@@ -171,6 +175,12 @@ static const char *col_path(int c)
         return "/dev/bus/other/../usb/001/001";
     case COL_SYS_FOLD_IN:
         return "/sys/class/../bus/usb/devices";
+    case COL_CLIMB:
+        return "/dev/bus/usb/001/../../..";
+    case COL_CLIMB_FILE:
+        return "/dev/bus/other/f/../../../null";
+    case COL_NODE_DOTDOT:
+        return "/dev/bus/usb/001/001/..";
     default:
         return "/dev/bus";
     }
@@ -207,13 +217,21 @@ static const char *col_path(int c)
 
 /* COL_SYS_FOLD_IN is the /sys mirror of COL_FOLD_IN, and the one direction that
  * stays unmet. /sys/class/../bus/usb/devices folds to a name this layer owns
- * and serves, and ownership is decided on that folded name -- but the resolve
+ * and serves, and ownership is decided on that folded name, but the resolve
  * behind it joins the unfolded suffix onto the scratch tree, which carries no
- * `class`, so the lookup fails and the layer answers its own authoritative
- * ENOENT for a directory it does serve. Recorded as XFAIL rather than repaired:
- * it is not this series\' doing, and the vectors header carries the measurement
- * against the merge base and the reason a fold cannot fix this half the way it
- * fixed the /dev one.
+ * class, so the lookup fails and the layer answers its own authoritative ENOENT
+ * for a directory it does serve. It is an XFAIL; the vectors header says why a
+ * fold cannot fix this half the way it fixes the /dev one.
+ */
+
+/* COL_CLIMB leaves /dev/bus through directories the layer serves and lands on
+ * /dev; its dirfd rows take the last '..' from a descriptor on /dev/bus.
+ * COL_CLIMB_FILE leaves after COL_BACK_DEV's regular file, which Linux answers
+ * ENOTDIR for, so a rewrite that trusts the lexical fold alone fails it.
+ */
+
+/* COL_NODE_DOTDOT puts a '..' after COL_NODE's character device, which Linux
+ * answers ENOTDIR for and a lexical fold would turn into the bus directory.
  */
 
 /* Names that must be listed by the union directories, one comma-free name per

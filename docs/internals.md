@@ -1677,15 +1677,31 @@ and then fails to serve is an answer, not a fall-through: taking the failure
 for one let `access(2)`, and then `statfs(2)`, answer from the backing while
 `open` and `stat` reported `ENOENT` for the same path.
 
-`.` and `..` are folded lexically before ownership is decided, on both halves.
-The fold is the ours/not-ours gate and nothing else -- the served path is built
-by `usb_sys_resolve_suffix`, which resolves symlinks and applies each `..` to
-what the previous component resolved to, the way the kernel does, so
-`<dev>/subsystem/..` names `/sys/bus`. Deciding ownership on the guest's
-spelling instead splits the two halves apart in both directions:
+`.` and `..` are folded before ownership is decided, on both halves. On `/sys`
+the fold is lexical and is the ours/not-ours gate and nothing else: the served
+path is built by `usb_sys_resolve_suffix`, which resolves symlinks and applies
+each `..` to what the previous component resolved to, as Linux does, so
+`<dev>/subsystem/..` names `/sys/bus`. On `/dev/bus` a `..` after a usbfs node
+is not applied, since Linux applies `..` only to a directory, and the name
+answers `ENOTDIR` once the node exists. A `..` after any other name is applied
+without checking that the name exists, so `/dev/bus/usb/099/../001/001` is
+served where Linux answers `ENOENT`. A relative name is folded the same way up
+to a usbfs node, so `099/../../../null` from a `/dev/bus/usb` cwd skips the
+check the climb rewrite makes for the absolute spelling. Deciding ownership on
+the unfolded spelling splits the two halves apart in both directions:
 `/dev/bus/usb/../other/f` reads as a malformed device number and is claimed,
 and `/dev/bus/other/../usb/001/002` reads as a foreign bus and is disowned.
 A suffix that folds away above its own root leaves as `USB_PATH_NONE`.
+
+A backing cannot apply such a `..` on `/dev/bus`: the directories are the
+layer's, and the macOS host has no `/dev/bus` at all. So a `/dev/bus` name that
+climbs out over the layer's own directories is first rewritten in the path
+layer to `/dev` followed by what comes after the `..` that climbed. A further
+`..` is applied to `/dev` and stops at `/`, so `/dev/bus/../../proc/self/status`
+reaches the `/proc` intercept. When the climb ends the name, the rewrite ends
+in `.`, as in `/dev/.`, so `rmdir` and `rename` fail rather than act on the
+directory reached, with `EINVAL` on a sysroot where Linux gives `ENOTEMPTY` and
+`EBUSY` for a final `..`.
 
 ### Filesystem Identity Of A Descriptor
 
@@ -1704,7 +1720,9 @@ The rules:
 - `/dev/bus` reports devtmpfs, on both entry points.
 - `..` is folded and a relative name is resolved against the cwd before either
   entry point decides, so the two cannot be handed different spellings of one
-  object.
+  object. A `..` after a usbfs node is the exception, and `statfs` asks
+  `/dev/bus` before its `/sys` fold so that it answers `ENOTDIR` as `stat`
+  does.
 
 A descriptor's identity comes from the virtual path stamped on its slot when
 this layer served the open, and from the descriptor's own host path mapped back

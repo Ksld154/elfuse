@@ -4,16 +4,17 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * Code under test: the /sys ours/not-ours split in src/runtime/usb-sysfs.c and
- * the /sys + /dev/bus arms of sys_fchdir (src/syscall/fs.c) and
- * resolve_proc_cwd_path (src/syscall/path.c).
+ * Code under test: the /sys ours/not-ours split in src/runtime/usb-sysfs.c, the
+ * /sys + /dev/bus arms of sys_fchdir (src/syscall/fs.c) and
+ * resolve_proc_cwd_path (src/syscall/path.c), and the /dev/bus climb rewrite in
+ * usb_sysfs_resolve_dev_climb and path_translate_at.
  *
  * Run under --sysroot over a tree that carries a real /sys skeleton
  * (/sys/class/net/eth0/address, /sys/kernel/mm/transparent_hugepage/enabled,
  * /sys/devices/system/node/online) and with ELFUSE_USB_FIXTURE set so the USB
  * tree carries two deterministic devices with no hardware attached.
  *
- * Two regressions are pinned here.
+ * Three regressions are pinned here.
  *
  * F1: the USB layer synthesizes only /sys/bus/usb. A name it does not model
  * (everything under /sys/class, /sys/kernel, /sys/devices) must fall through to
@@ -29,6 +30,10 @@
  * lands in the read-only tree, and fstatfs reports the /tmp filesystem instead
  * of sysfs. The cubic behavior that must survive: a relative walk resolved
  * against that cwd still reaches the synthetic attributes.
+ *
+ * F3: a '..' out of /dev/bus that ends the name must not let rmdir or rename
+ * act on the sysroot's /dev, which the lane leaves empty, and one that lands in
+ * /sys must reach the sysroot's files there.
  */
 
 #include <dirent.h>
@@ -226,6 +231,38 @@ int main(void)
             PASS();
         else
             FAIL("relative 1-1/idVendor against the /sys cwd");
+    }
+
+    /* Linux refuses to remove or rename a final '..' (do_rmdir and do_renameat2
+     * in fs/namei.c), whatever it resolves to.
+     */
+    TEST("rmdir and rename of /dev/bus/.. leave /dev in place");
+    {
+        struct stat st;
+        if (rmdir("/dev/bus/..") == 0 ||
+            rename("/dev/bus/..", "/dev-moved") == 0)
+            FAIL("a final '..' out of /dev/bus was acted on");
+        else if (stat("/dev", &st) != 0 || !S_ISDIR(st.st_mode))
+            FAIL("stat(\"/dev\")");
+        else
+            PASS();
+    }
+
+    /* path_translate_at runs usb_sysfs_resolve_dev_climb before
+     * usb_sysfs_resolve_guest_path, which applies a '..' after a subsystem link
+     * to the link's target.
+     */
+    TEST(
+        "a climb out of /dev/bus through a subsystem link reaches the sysroot");
+    {
+        ssize_t n = read_file(
+            "/dev/bus/../../sys/bus/usb/devices/1-1/"
+            "subsystem/../../class/net/eth0/address",
+            buf, sizeof(buf));
+        if (n < 0 || strcmp(buf, "02:42:ac:11:00:02\n") != 0)
+            FAIL("read /sys/class/net/eth0/address through the climb");
+        else
+            PASS();
     }
 
     SUMMARY("test-usb-sysfs-sysroot");

@@ -881,17 +881,26 @@ int64_t sys_openat_path(guest_t *g,
         return guest_fd;
     }
 
+    char usb_node[sizeof("/dev/bus/usb/BBB/DDD")];
+
     /* Intercept /proc and /dev paths before touching the host filesystem */
     if (path_might_use_open_intercept(tx.intercept_path)) {
         if (!strcmp(tx.intercept_path, "/dev/fuse"))
             return fuse_proc_open(linux_flags);
 
         /* /dev/bus/usb/BBB/DDD: typed FD_USBDEV constructor (any access mode
-         * except O_PATH, which the stage-1 placeholder serves).
+         * except O_PATH, which the stage-1 placeholder serves). A node named
+         * through '..' is passed on as /dev/bus/usb/BBB/DDD, the only spelling
+         * usbdev_open_path accepts and the one the placeholder's descriptor is
+         * stamped with.
          */
-        int64_t usb_fd = usbdev_open_path(tx.intercept_path, linux_flags);
-        if (usb_fd != INT64_MIN)
-            return usb_fd;
+        if (usb_sysfs_node_path(tx.intercept_path, usb_node,
+                                sizeof(usb_node))) {
+            tx.intercept_path = usb_node;
+            int64_t usb_fd = usbdev_open_path(usb_node, linux_flags);
+            if (usb_fd != INT64_MIN)
+                return usb_fd;
+        }
         int64_t fuse_fd =
             fuse_open_path(g, tx.intercept_path, linux_flags, mode);
         if (fuse_fd != INT64_MIN)
@@ -963,12 +972,14 @@ int64_t sys_openat_path(guest_t *g,
              * walk off such a descriptor restart from the link's own directory
              * instead. Ask the descriptor what it holds; it names the link
              * itself for the O_PATH|O_NOFOLLOW open that asked for the link,
-             * and the target for every open that followed one.
+             * and the target for every open that followed one. Under /dev/bus
+             * the request may spell a '..' the layer applied, and the
+             * descriptor names the directory it reached.
              */
-            char sys_stamp[LINUX_PATH_MAX];
-            if (usb_sysfs_guest_path_for_fd(intercepted, sys_stamp,
-                                            sizeof(sys_stamp)) > 0)
-                stamp = sys_stamp;
+            char usb_stamp[LINUX_PATH_MAX];
+            if (usb_sysfs_guest_path_for_fd(intercepted, usb_stamp,
+                                            sizeof(usb_stamp)) > 0)
+                stamp = usb_stamp;
 
             if (alias_fd >= 0)
                 stamp = (aliased && alias_src.proc_path[0] != '\0')

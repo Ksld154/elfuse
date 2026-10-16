@@ -75,6 +75,35 @@ int usb_sysfs_resolve_guest_path(const char *guest_path,
                                  char *out,
                                  size_t outsz);
 
+/* Whether the folded guest name @guest_path is a usbfs node, by its shape
+ * alone; it takes no lock.
+ */
+bool usb_sysfs_names_node(const char *guest_path);
+
+/* The canonical /dev/bus/usb/BBB/DDD spelling of @guest_path when it names a
+ * usbfs node once its '.' and '..' are folded as the stat intercept folds them.
+ * usbdev_open_path takes only that spelling. A name that ends in the directory
+ * requirement path_dir_required reports is left to the intercepts, which answer
+ * ENOTDIR for a node.
+ *
+ * Returns true with @out filled, or false when @guest_path names no node or the
+ * folded name does not fit @outsz.
+ */
+bool usb_sysfs_node_path(const char *guest_path, char *out, size_t outsz);
+
+/* Rewrite a /dev/bus name that climbs out of /dev/bus with '..', popping only
+ * directories the layer serves, to /dev followed by what comes after the '..'
+ * that climbed, or to /dev/. when nothing does. Those directories are the
+ * layer's, and the macOS host has no /dev/bus at all, so the '..' cannot be
+ * left to the backing; a walk through any other name is. A further '..' is
+ * applied to /dev and stops at the root.
+ *
+ * Returns true with @out filled, or false when nothing is rewritten.
+ */
+bool usb_sysfs_resolve_dev_climb(const char *guest_path,
+                                 char *out,
+                                 size_t outsz);
+
 /* Malloc'd copy of the usbfs descriptors blob (18-byte little-endian device
  * descriptor followed by every raw configuration descriptor in index order) for
  * the device at busnum/devnum. This is the exact byte sequence read() returns
@@ -87,18 +116,20 @@ int usb_sysfs_resolve_guest_path(const char *guest_path,
  */
 uint8_t *usb_sysfs_descriptors_dup(int busnum, int devnum, size_t *len_out);
 
-/* The guest /sys spelling of the object an open descriptor holds, for stamping
- * a synthetic identity on it.
+/* The guest /sys or /dev/bus spelling of the object an open descriptor holds,
+ * for stamping a synthetic identity on it.
  *
- * The name the guest opened is not always the name it got: a `subsystem` link
+ * The name the guest opened is not always the name it got: a subsystem link
  * opened for following names the directory it resolves to, and every relative
  * openat off that descriptor must walk from there. Asking the descriptor
- * instead of the request is what makes the two agree -- F_GETPATH reports the
+ * instead of the request is what makes the two agree: F_GETPATH reports the
  * link's own path for the O_PATH|O_NOFOLLOW open that deliberately named the
- * link, and the target's path for every open that followed it.
+ * link, and the target's path for every open that followed it. Under /dev/bus
+ * the request may spell a '..' the layer applied, and the descriptor names the
+ * directory it reached.
  *
- * Returns 1 with `out` filled, or 0 when the descriptor is not in the sysfs
- * tree (including when the tree does not exist).
+ * Returns 1 with @out filled, or 0 when the descriptor is in neither synthetic
+ * tree (including when the trees do not exist).
  */
 int usb_sysfs_guest_path_for_fd(int host_fd, char *out, size_t outsz);
 
