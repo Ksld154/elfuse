@@ -13,6 +13,7 @@
  *   - Socket options: SOL_SOCKET option constants differ
  */
 
+#include <limits.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -581,7 +582,28 @@ int64_t sys_listen(int fd, int backlog)
     if (ref_err < 0)
         return ref_err;
 
-    if (listen(host_ref.fd, backlog) < 0) {
+    /* Linux lets backlog + 1 connections wait (sk_acceptq_is_full,
+     * unix_recvq_full) where macOS lets backlog wait and reads 0 as somaxconn.
+     * Both read a negative backlog as somaxconn, and macOS caps the rest there.
+     */
+    int host_backlog = backlog;
+    if (backlog >= 0 && backlog < INT_MAX)
+        host_backlog = backlog + 1;
+
+    /* macOS 27.0 loses the urgent mark of the first urgent byte on about half
+     * of the TCP connections accepted from a listener with backlog 1, so the
+     * guest gets neither SIGURG nor recv(MSG_OOB). A TCP listen(fd, 0) queues 2
+     * instead of the 1 Linux queues.
+     */
+    if (host_backlog == 1) {
+        struct sockaddr_storage ss;
+        socklen_t len = sizeof(ss);
+        if (getsockname(host_ref.fd, (struct sockaddr *) &ss, &len) == 0 &&
+            (ss.ss_family == AF_INET || ss.ss_family == AF_INET6))
+            host_backlog = 2;
+    }
+
+    if (listen(host_ref.fd, host_backlog) < 0) {
         host_fd_ref_close(&host_ref);
         return linux_errno();
     }
