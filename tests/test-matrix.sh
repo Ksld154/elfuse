@@ -921,6 +921,8 @@ run_unit_tests()
     test_check "$runner" "test-readv-writev" "PASS" "$bindir/test-readv-writev"
     test_check "$runner" "test-writev-huge-iovec" "0 failed" \
         "$bindir/test-writev-huge-iovec"
+    test_rc "$runner" "test-symlink-chain-splice" 0 \
+        "$bindir/test-symlink-chain-splice"
 
     printf "\ninotify emulation\n"
     test_check "$runner" "test-inotify" "PASS" "$bindir/test-inotify"
