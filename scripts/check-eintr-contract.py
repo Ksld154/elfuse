@@ -202,11 +202,6 @@ INVENTORY = {
         "as in-flight only under syscall_is_restarted(), and the retry waits "
         "the same connection out instead of opening a second one.",
     ),
-    "syscall/net.c::sys_sendto": (
-        "restartable",
-        "POLLOUT wait, then send. An interrupted wait has sent nothing, and a "
-        "send that moved bytes returns the count.",
-    ),
     "syscall/net.c::do_accept": (
         "restartable",
         "The readiness wait precedes accept, so an interrupted wait has not "
@@ -217,18 +212,13 @@ INVENTORY = {
         "The first wait precedes recvfrom, and later interrupted waits return "
         "the accumulated count instead of EINTR.",
     ),
-    "syscall/net-msg.c::sys_sendmsg": (
+    "syscall/net-msg.c::net_send_xfer": (
         "restartable",
-        "The wait sits before its send in the EAGAIN retry loop, so EINTR "
-        "means nothing left the socket.",
-    ),
-    "syscall/net-msg.c::net_send_single_iov": (
-        "restartable",
-        "Same shape, for the single-iovec fast path both sendmsg and sendmmsg "
-        "take: the wait precedes the send, so EINTR means nothing left the "
-        "socket. sys_sendmmsg forwards this result and carries no wait of its "
-        "own, so it is not listed; its loop reports the delivered count rather "
-        "than the error once a message has gone out.",
+        "The one send loop sendto, sendmsg and the single-iovec fast path share. "
+        "Each POLLOUT wait precedes its send, EINTR is returned only when no "
+        "byte has moved, and an interrupted wait after progress returns the "
+        "count. sys_sendmmsg forwards this result and reports the delivered "
+        "count once a message has gone out.",
     ),
     "syscall/net-msg.c::sys_recvmsg": (
         "restartable",

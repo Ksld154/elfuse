@@ -857,6 +857,8 @@ run_unit_tests()
         "$bindir/test-socket-shortwrite"
     test_check "$runner" "test-socket-blockwrite-signal" "0 failed" \
         "$bindir/test-socket-blockwrite-signal"
+    test_check "$runner" "test-socket-blocking-send" "0 failed" \
+        "$bindir/test-socket-blocking-send"
     test_check "$runner" "test-socket-accept-contended" "0 failed" \
         "$bindir/test-socket-accept-contended"
     test_check "$runner" "test-socket-waitall" "0 failed" \
@@ -915,6 +917,8 @@ run_unit_tests()
 
     printf "\nScatter-gather I/O\n"
     test_check "$runner" "test-readv-writev" "PASS" "$bindir/test-readv-writev"
+    test_check "$runner" "test-writev-huge-iovec" "0 failed" \
+        "$bindir/test-writev-huge-iovec"
 
     printf "\ninotify emulation\n"
     test_check "$runner" "test-inotify" "PASS" "$bindir/test-inotify"

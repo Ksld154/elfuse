@@ -7,17 +7,13 @@
  * readv, writev, preadv, pwritev, recvmsg and sendmsg all take an iovec array
  * the guest wrote, and every one of them sums iov_len across it. Linux returns
  * EINVAL when that sum exceeds SSIZE_MAX; elfuse has to do the same, because
- * the sum reaches a malloc extent and a memcpy loop on the /proc
- * write-intercept path. A wrapped sum there is a small allocation followed by a
- * large copy.
+ * the sum decides the transfer length and the completion test of every one of
+ * those paths.
  *
- * io.c carried four copies of the accumulation with three different guards, and
- * proc_try_writev_intercept had none at all: it summed straight into malloc().
- * That one was unreachable in practice, since host_iov_prepare clamps each
- * entry to the guest mapping it points into, but unreachable by provenance
- * rather than by construction. One proved add now serves every site:
- * urandom_fill_iov, validate_iov_total, proc_try_writev_intercept and
- * process_vm_import_iov.
+ * io.c carried four copies of the accumulation with three different guards. One
+ * proved add now replaces all four (urandom_fill_iov, validate_iov_total,
+ * proc_try_writev_intercept and process_vm_import_iov), and the readv/writev
+ * loop in io.c, net_send_xfer and the netlink receive call it too.
  *
  * Split into a header because io.c and net-msg.c cannot be given to Frama-C:
  * they include the macOS uio and socket headers, which the analyzer's libc does

@@ -18,6 +18,8 @@
 #include "syscall/linux-wire.h" /* linux_iovec_t */
 #include "syscall/internal.h"   /* fd_block_state_t */
 
+struct msghdr;
+
 /* Linux address families. */
 #define LINUX_AF_UNSPEC 0
 #define LINUX_AF_UNIX 1
@@ -237,6 +239,11 @@ int sock_creation_flags(int nonblock, int cloexec);
 /* True when MSG_WAITALL is removed before this recv reaches the host. */
 bool recv_strip_waitall(int linux_flags);
 
+/* True when the host socket is SOCK_STREAM; false when it is not or the probe
+ * fails.
+ */
+bool host_socket_is_stream(int host_fd);
+
 /* True when this recv must gather MSG_WAITALL itself. See the definition in
  * net.c for the measurement.
  */
@@ -255,6 +262,32 @@ bool net_recv_should_retry(const fd_block_state_t *st,
                            int host_fd,
                            int msg_flags,
                            ssize_t ret);
+
+/* Send msg on host_fd with the blocking semantics the guest asked for, without
+ * parking this vCPU thread in a host call.
+ *
+ * The contract is elfuse's own: wait for POLLOUT first, then a send that
+ * reports EAGAIN instead of blocking, retried when a sibling took the space
+ * first. macOS does not honor MSG_DONTWAIT on AF_UNIX, which is why the wait
+ * comes before the send rather than the send driving it. The EAGAIN rests on
+ * elfuse owning O_NONBLOCK on the host description, so a description it did not
+ * open (one received over SCM_RIGHTS, inherited stdio) keeps its host flag, and
+ * a send on it can still park the thread. A blocking stream send goes round
+ * again until every byte has moved, as Linux does, and reports the partial
+ * count when a signal or an error arrives after some bytes went; MSG_DONTWAIT,
+ * a nonblocking socket, and a datagram send take one round. SO_SNDTIMEO is not
+ * honored by the wait.
+ *
+ * msg is scratch: a partial stream send advances its iovec and drops its
+ * control data and address, which belong to the first round only.
+ *
+ * Returns the byte count or a negative Linux errno, with SIGPIPE queued for an
+ * EPIPE that moved nothing unless MSG_NOSIGNAL was given.
+ */
+int64_t net_send_xfer(const fd_block_state_t *st,
+                      int host_fd,
+                      struct msghdr *msg,
+                      int linux_flags);
 int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int flags);
 int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags);
 int64_t sys_sendmmsg(guest_t *g,

@@ -764,11 +764,17 @@ int64_t sys_accept4(guest_t *g,
 
 int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
 {
+    /* The whole entry, not only the block state: the rosettad upgrade below
+     * rebuilds this slot from its record, and that record has to describe the
+     * descriptor pinned here rather than whatever a sibling reopened the number
+     * as since.
+     */
     host_fd_ref_t host_ref;
-    fd_block_state_t sock_st;
-    int64_t ref_err = host_fd_ref_open_state(fd, &host_ref, &sock_st);
+    fd_entry_t snap;
+    int64_t ref_err = host_fd_ref_open_entry(fd, &host_ref, &snap);
     if (ref_err < 0)
         return ref_err;
+    fd_block_state_t sock_st = fd_block_state_of(&snap);
 
     uint8_t linux_sa[128];
     if (addrlen > sizeof(linux_sa)) {
@@ -848,11 +854,8 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
          * Testing the old host status instead would have been vacuous now that
          * every socket elfuse opens carries O_NONBLOCK.
          */
-        fd_entry_t snap;
-        bool have_snap = fd_snapshot(fd, &snap);
-        if ((have_snap && snap.nonblock_owned &&
-             fd_set_nonblock(pair[0]) < 0) ||
-            (have_snap && (snap.linux_flags & LINUX_O_CLOEXEC) &&
+        if ((snap.nonblock_owned && fd_set_nonblock(pair[0]) < 0) ||
+            ((snap.linux_flags & LINUX_O_CLOEXEC) &&
              fd_set_cloexec(pair[0]) < 0)) {
             close(pair[0]);
             close(pair[1]);
@@ -866,26 +869,21 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
          * walks. The aliases still carry the pre-upgrade host fd, a deeper
          * divergence this path does not close; keeping the identity is what
          * stops it from also breaking the sweeps.
+         *
+         * -1, not fd: this path is rebuilding the very slot it snapshotted, so
+         * re-reading it under the publish lock would find the replacement being
+         * installed rather than the source.
          */
-        fd_alias_spec_t spec;
-        if (have_snap)
-
-            /* -1, not fd: this path is rebuilding the very slot it snapshotted,
-             * so re-reading it under the publish lock would find the
-             * replacement being installed rather than the source.
-             */
-            spec = fd_alias_of(-1, &snap);
-        int alloc_rc =
-            fd_alloc_alias_at(have_snap ? &spec : NULL, fd, FD_SOCKET, pair[0],
-                              absock_unregister_fd, NULL);
+        fd_alias_spec_t spec = fd_alias_of(-1, &snap);
+        int alloc_rc = fd_alloc_alias_at(&spec, fd, FD_SOCKET, pair[0],
+                                         absock_unregister_fd, NULL);
         if (alloc_rc < 0) {
             close(pair[0]);
             close(pair[1]);
             host_fd_ref_close(&host_ref);
             return -LINUX_EMFILE;
         }
-        if (have_snap)
-            fd_table[fd].linux_flags = snap.linux_flags;
+        fd_table[fd].linux_flags = snap.linux_flags;
         net_socket_cache_init_defaults(fd, LINUX_AF_UNIX, cached_type);
 
         if (rosettad_start_handler(pair[1], pair[0]) < 0) {
@@ -1066,13 +1064,6 @@ int64_t sys_sendto(guest_t *g,
     if (len > avail)
         len = avail;
 
-    int mac_flags = translate_msg_flags(linux_flags);
-
-    /* MSG_NOSIGNAL (0x4000): suppress SIGPIPE on EPIPE. macOS has no
-     * MSG_NOSIGNAL; elfuse handles it by not queuing SIGPIPE.
-     */
-    int suppress_sigpipe = (linux_flags & LINUX_MSG_NOSIGNAL);
-
     /* sendto with a NULL destination is send(); merge both forms. */
     struct sockaddr_storage mac_sa;
     struct sockaddr *dest = NULL;
@@ -1096,28 +1087,15 @@ int64_t sys_sendto(guest_t *g,
         dest_len = (socklen_t) mac_len;
     }
 
-    bool blocking =
-        len > 0 && sock_op_should_block(&send_st, host_ref.fd, linux_flags);
-    int host_flags = mac_flags | (blocking ? MSG_DONTWAIT : 0);
-    ssize_t ret;
-    for (;;) {
-        if (blocking) {
-            int64_t waited = io_wait_fd_or_interrupted(host_ref.fd, POLLOUT);
-            if (waited < 0) {
-                host_fd_ref_close(&host_ref);
-                return waited;
-            }
-        }
-        ret = sendto(host_ref.fd, buf, len, host_flags, dest, dest_len);
-        if (!(blocking && ret < 0 && errno == EAGAIN))
-            break;
-    }
+    struct iovec iov = {.iov_base = buf, .iov_len = len};
+    struct msghdr msg = {
+        .msg_name = dest,
+        .msg_namelen = dest_len,
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+    };
+    int64_t ret = net_send_xfer(&send_st, host_ref.fd, &msg, linux_flags);
     host_fd_ref_close(&host_ref);
-    if (ret < 0) {
-        if (errno == EPIPE && !suppress_sigpipe)
-            signal_queue(LINUX_SIGPIPE);
-        return linux_errno();
-    }
     return ret;
 }
 
@@ -1160,16 +1138,19 @@ bool recv_strip_waitall(int linux_flags)
     return (linux_flags & LINUX_MSG_WAITALL) != 0;
 }
 
+bool host_socket_is_stream(int host_fd)
+{
+    int so_type = 0;
+    socklen_t len = sizeof(so_type);
+    return getsockopt(host_fd, SOL_SOCKET, SO_TYPE, &so_type, &len) == 0 &&
+           so_type == SOCK_STREAM;
+}
+
 bool recv_gathers_waitall(int host_fd, int linux_flags)
 {
     if (!(linux_flags & LINUX_MSG_WAITALL) || (linux_flags & LINUX_MSG_PEEK))
         return false;
-
-    int sotype = 0;
-    socklen_t sotype_len = sizeof(sotype);
-    if (getsockopt(host_fd, SOL_SOCKET, SO_TYPE, &sotype, &sotype_len) < 0)
-        return false;
-    return sotype == SOCK_STREAM;
+    return host_socket_is_stream(host_fd);
 }
 
 

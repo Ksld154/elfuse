@@ -193,6 +193,9 @@ static pthread_mutex_t syscpu_dir_lock = PTHREAD_MUTEX_INITIALIZER;
  */
 static _Atomic int oom_score_adj_value = 0;
 
+/* PROC_NUMBUF - 1 in Linux fs/proc/base.c */
+#define PROC_OOM_WRITE_MAX 12
+
 /* Serializes backing-fd rewrites so concurrent writers do not race the
  * truncate+pwrite sequence that publishes the new value to a same-fd reader.
  * The atomic store happens last so a failed rewrite leaves the global state
@@ -3506,6 +3509,13 @@ int proc_intercept_write(int guest_fd,
         *written_out = 0;
         return 1;
     }
+
+    /* Linux oom_score_adj_write and oom_adj_write copy at most PROC_NUMBUF - 1
+     * bytes into a 13-byte stack buffer, parse that, and return the clamped
+     * count, so a longer write is a short write of the prefix.
+     */
+    if (count > PROC_OOM_WRITE_MAX)
+        count = PROC_OOM_WRITE_MAX;
 
     int val;
     if (proc_parse_int_write(buf, count, &val) < 0)
