@@ -118,9 +118,10 @@ static _Thread_local int sigreturn_cookie_depth;
 
 /* Protects signal actions array. Multiple threads may call rt_sigaction
  * concurrently (e.g., during musl init). Blocked masks are per-thread (each
- * thread_entry_t has its own blocked / saved_blocked).
+ * thread_entry_t has its own blocked / saved_blocked). Its place in the
+ * acquisition order is the lock-ordering block in src/syscall/internal.h.
  */
-static pthread_mutex_t sig_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 4 */
+static pthread_mutex_t sig_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Atomic "maybe pending" hint. signal_queue() sets it before releasing the
  * queue lock, and signal_deliver() clears it after draining visible state. The
@@ -642,16 +643,6 @@ void signal_queue(int signum)
      */
     if (signal_should_interrupt(signum))
         attention_raise();
-}
-
-void signal_queue_rt(int signum,
-                     int32_t si_code,
-                     int32_t si_pid,
-                     uint32_t si_uid,
-                     int32_t si_int,
-                     uint64_t si_ptr)
-{
-    signal_queue_info(signum, si_code, si_pid, si_uid, si_int, si_ptr);
 }
 
 void signal_queue_info(int signum,
@@ -2400,8 +2391,29 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
      * the SVC as whatever syscall that value names. Undoing the rewind also
      * gives the guest back the EINTR it was going to get, which this signal now
      * explains. See syscall_restart_arm in syscall/proc.h.
+     *
+     * Only on the syscall-return path, though. A vCPU kicked at EL0 after the
+     * ERET has already taken the restart: PC sits on the rewound SVC with the
+     * guest's argument still in X0 and the shim frame's X8 restored, and
+     * ELR_EL1 still holds the rewound value because no exception has replaced
+     * it. Cancel would match that stale ELR and write the EINTR into the live
+     * X0, the frame would save it, and the SVC would run after rt_sigreturn
+     * with -4 as its first argument. Leaving the restart alone is what Linux
+     * shows: the handler runs before the restarted call. The armed record is
+     * left alone, but the handler's own first syscall (rt_sigreturn at the
+     * latest) is the next dispatch, fails the ELR and syscall-number witness,
+     * and clears it. The SVC re-executed after rt_sigreturn therefore reads as
+     * a fresh call, so syscall_is_restarted() is false there: a connect that
+     * finished while the handler ran reports EISCONN where Linux returns 0.
+     * Narrow (a leader-work EINTR, then an EL0 kick before the rewound SVC
+     * runs), and left as is: keeping the record alive across the handler would
+     * let it match an unrelated later call at the same SVC site.
      */
-    syscall_restart_cancel(vcpu);
+    uint64_t cur_cpsr = 0;
+    hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cur_cpsr);
+    bool el0_preempt = (cur_cpsr & 0xfULL) == 0;
+    if (!el0_preempt)
+        syscall_restart_cancel(vcpu);
 
     /* 1. Save current vCPU state.
      *
@@ -2419,9 +2431,6 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
      */
     uint64_t saved_regs[31];
     uint64_t saved_sp, saved_pc, saved_pstate;
-    uint64_t cur_cpsr = 0;
-    hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cur_cpsr);
-    bool el0_preempt = (cur_cpsr & 0xfULL) == 0;
 
     vcpu_snapshot_gprs(vcpu, saved_regs);
     saved_sp = vcpu_get_sysreg(vcpu, HV_SYS_REG_SP_EL0);

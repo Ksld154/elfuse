@@ -79,7 +79,7 @@ static void build_kernel_siginfo(int sig,
 
     /* Kernel ignores the upper 4 bytes of si_value's int form, but writes the
      * pointer form into the full 8-byte slot at offset 24 for sigval_t. The
-     * pointer goes into the low 8 bytes so signal_queue_rt() reads either
+     * pointer goes into the low 8 bytes so signal_queue_info() reads either
      * representation correctly.
      */
     u64 = (uint64_t) (uintptr_t) payload_ptr;

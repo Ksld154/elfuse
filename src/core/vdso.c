@@ -1372,6 +1372,15 @@ void vdso_attention_and(guest_t *g, uint32_t mask)
         return;
     _Atomic uint32_t *attention =
         (_Atomic uint32_t *) (page + VDSO_OFF_VVAR + VVAR_OFF_ATTENTION);
+
+    /* A clear that changes no bit is skipped rather than written, because
+     * shim_globals_recompute_attention issues one after every forwarded syscall
+     * and the RMW would bounce this line between vCPUs. Nothing is lost: the
+     * trampolines that read this word read no cred slot or other data published
+     * under it, so there is no store the RELEASE would order for them.
+     */
+    if (!(atomic_load_explicit(attention, memory_order_relaxed) & ~mask))
+        return;
     atomic_fetch_and_explicit(attention, mask, memory_order_release);
 }
 

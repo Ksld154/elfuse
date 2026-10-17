@@ -407,14 +407,6 @@ bool signal_queue_thread_info(int64_t tid,
                               int32_t si_int,
                               uint64_t si_ptr);
 
-/* Queue an RT signal with sender metadata and payload from sigqueue. */
-void signal_queue_rt(int signum,
-                     int32_t si_code,
-                     int32_t si_pid,
-                     uint32_t si_uid,
-                     int32_t si_int,
-                     uint64_t si_ptr);
-
 /* Queue a signal with explicit siginfo metadata. Standard signals preserve one
  * payload while coalesced; RT signals enqueue every instance.
  */
