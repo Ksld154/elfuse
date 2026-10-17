@@ -2231,27 +2231,16 @@ int guest_region_add_ex_gpa(guest_t *g,
                                          0);
 }
 
+/* next_vma_id is a high-water mark over every live vma_id: IDs originate here,
+ * an explicit ID passed to guest_region_add_ex_owned_gpa raises the mark, and
+ * fork restore reseeds it to the restored maximum. No live region can hold the
+ * next value, so no table scan is needed. It cannot wrap in practice: each ID
+ * costs at least one guest syscall, and 2^64 of them at one per nanosecond is
+ * centuries.
+ */
 static uint64_t allocate_vma_id(guest_t *g)
 {
-    uint64_t candidate = g->next_vma_id;
-
-    for (;;) {
-        candidate++;
-        if (candidate == 0)
-            candidate = 1;
-
-        bool in_use = false;
-        for (int i = 0; i < g->nregions; i++) {
-            if (g->regions[i].vma_id == candidate) {
-                in_use = true;
-                break;
-            }
-        }
-        if (!in_use) {
-            g->next_vma_id = candidate;
-            return candidate;
-        }
-    }
+    return ++g->next_vma_id;
 }
 
 void guest_reseed_next_vma_id(guest_t *g)
@@ -3711,16 +3700,8 @@ int guest_install_va_pages(guest_t *g,
 int guest_materialize_lazy(guest_t *g, uint64_t fault_offset)
 {
     /* Find the noreserve region containing this offset */
-    const guest_region_t *region = NULL;
-    for (int i = 0; i < g->nregions; i++) {
-        if (g->regions[i].start <= fault_offset &&
-            g->regions[i].end > fault_offset && g->regions[i].noreserve) {
-            region = &g->regions[i];
-            break;
-        }
-    }
-
-    if (!region)
+    const guest_region_t *region = guest_region_find(g, fault_offset);
+    if (!region || !region->noreserve)
         return -1; /* Not a noreserve region */
 
     /* Materialize one 2MiB block containing the fault address. This is the
