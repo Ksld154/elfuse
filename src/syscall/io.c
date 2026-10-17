@@ -36,6 +36,7 @@
 #include "proved/slice.h"
 
 #include "core/rosetta.h"
+#include "core/host-sigbus.h"
 #include "core/shim-globals.h"
 #include "hvutil.h"
 #include "runtime/futex.h" /* futex_interrupt_consume, in the tty drain */

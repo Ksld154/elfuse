@@ -5029,8 +5029,8 @@ static void mmap_fork_dispose_anon_shared_txn(
     *txn_ptr = NULL;
 }
 
-int mmap_fork_prepare_anon_shared(guest_t *g,
-                                  mmap_fork_anon_shared_txn_t **txn_out)
+int mmap_fork_prepare_anon_shared_locked(guest_t *g,
+                                         mmap_fork_anon_shared_txn_t **txn_out)
 {
     /* Callers must provide a non-NULL txn_out: the transaction handle is the
      * only way to commit or abort the partial state mutated below. Reject up
@@ -5044,7 +5044,7 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
     if (!txn)
         return -LINUX_ENOMEM;
 
-    mmap_lock_acquire();
+    assert(mmap_lock_held());
 
     size_t hps = host_page_size_cached();
 
@@ -5190,7 +5190,6 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
             for (int k = 0; k < n_regions; k++)
                 close(dup_fds[k]);
             close(fd);
-            mmap_lock_release();
             *txn_out = txn;
             return -LINUX_ENOMEM;
         }
@@ -5203,7 +5202,6 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
             for (int k = 0; k < n_regions; k++)
                 close(dup_fds[k]);
             close(fd);
-            mmap_lock_release();
             *txn_out = txn;
             return nsnaps;
         }
@@ -5243,7 +5241,6 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
         close(fd);
     }
 
-    mmap_lock_release();
     *txn_out = txn;
     return 0;
 }

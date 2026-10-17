@@ -62,8 +62,8 @@ static inline uint64_t sp_el1_top(const guest_t *g)
 /* Thread table. */
 
 static thread_entry_t thread_table[MAX_THREADS];
-static pthread_mutex_t thread_lock =
-    PTHREAD_MUTEX_INITIALIZER; /* Lock order: 5 */
+/* Ordering: see the lock-ordering block in syscall/internal.h. */
+static pthread_mutex_t thread_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic int active_thread_count = 0;
 
 /* Fork barrier state. Protected by thread_lock. Declared here (rather than
@@ -600,7 +600,7 @@ static void thread_join_workers_mode(bool exec_mode)
      * joined or detached. Entries a previous pass already detached
      * (join_abandoned) are skipped outright: joining or detaching the same
      * pthread twice is undefined, and main()'s join is followed by
-     * guest_destroy's internal one.
+     * launch_destroy_guest's internal one.
      */
     struct {
         pthread_t thr;
@@ -617,10 +617,10 @@ static void thread_join_workers_mode(bool exec_mode)
             continue;
 
         /* Never wait for the main thread (slot 0): its entry only deactivates
-         * inside guest_destroy, which runs on the main thread AFTER its own
-         * thread_join_workers. A worker waiting here (exit_group called from a
-         * worker) would burn the full cap on it, and the resulting mutual wait
-         * (worker polling main while main polls the worker) ends in
+         * inside launch_destroy_guest, which runs on the main thread AFTER its
+         * own thread_join_workers. A worker waiting here (exit_group called
+         * from a worker) would burn the full cap on it, and the resulting
+         * mutual wait (worker polling main while main polls the worker) ends in
          * pthread_detach on both sides, leaving the loser to touch guest memory
          * after guest_destroy unmaps it.
          */
@@ -748,10 +748,10 @@ bool thread_destroy_all_vcpus(hv_vcpu_t main_vcpu,
     pthread_mutex_lock(&thread_lock);
     THREAD_FOR_EACH_ACTIVE (t) {
         /* The main vCPU is the only handle owned by the thread running
-         * guest_destroy, so it is the only one this thread may destroy. The
-         * vcpu_valid term guards a not-yet-published worker whose t->vcpu still
-         * reads 0 from colliding with a main_vcpu handle of 0 (a valid value
-         * for the first vCPU).
+         * launch_destroy_guest, so it is the only one this thread may destroy.
+         * The vcpu_valid term guards a not-yet-published worker whose t->vcpu
+         * still reads 0 from colliding with a main_vcpu handle of 0 (a valid
+         * value for the first vCPU).
          */
         if (main_vcpu_valid && t->vcpu_valid && t->vcpu == main_vcpu) {
             hv_vcpu_destroy(t->vcpu);
@@ -800,8 +800,8 @@ bool thread_destroy_all_vcpus(hv_vcpu_t main_vcpu,
          * munmap run while the worker is live without corrupting kernel state
          * and panicking the host. vcpu_valid alone is not a sufficient proxy --
          * a bring-up worker is active with vcpu_valid still false. Report it so
-         * guest_destroy defers teardown to process exit, the only safe way to
-         * stop a foreign vCPU.
+         * launch_destroy_guest defers teardown to process exit, the only safe
+         * way to stop a foreign vCPU.
          */
         live_workers = true;
     }
@@ -1578,29 +1578,6 @@ int thread_prepare_deferred_stack_unmaps_for_cleanup(thread_entry_t *t,
     return nranges;
 }
 
-int thread_peek_deferred_stack_unmaps(thread_entry_t *t,
-                                      uint64_t *starts,
-                                      uint64_t *ends,
-                                      int max_ranges)
-{
-    int nranges = 0;
-
-    if (!t || !starts || !ends || max_ranges <= 0)
-        return 0;
-
-    pthread_mutex_lock(&thread_lock);
-    nranges = t->deferred_stack_unmap_count;
-    if (nranges > max_ranges)
-        nranges = max_ranges;
-    for (int i = 0; i < nranges; i++) {
-        starts[i] = t->deferred_stack_unmap_starts[i];
-        ends[i] = t->deferred_stack_unmap_ends[i];
-    }
-    pthread_mutex_unlock(&thread_lock);
-
-    return nranges;
-}
-
 int thread_drop_deferred_stack_unmap(thread_entry_t *t,
                                      uint64_t start,
                                      uint64_t end)
@@ -1626,17 +1603,6 @@ int thread_drop_deferred_stack_unmap(thread_entry_t *t,
     pthread_mutex_unlock(&thread_lock);
 
     return removed;
-}
-
-void thread_clear_stack_map(thread_entry_t *t)
-{
-    if (!t)
-        return;
-
-    pthread_mutex_lock(&thread_lock);
-    t->stack_map_start = 0;
-    t->stack_map_end = 0;
-    pthread_mutex_unlock(&thread_lock);
 }
 
 static int thread_add_deferred_unmap_locked(thread_entry_t *t,

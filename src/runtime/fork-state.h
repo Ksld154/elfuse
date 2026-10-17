@@ -130,7 +130,12 @@ int fork_ipc_read_all(int fd, void *buf, size_t len);
 int fork_ipc_send_fds(int sock, const int *fds, int count);
 int fork_ipc_recv_fds(int sock, int *fds, int max_count, int *out_count);
 
-int fork_ipc_send_memory_regions(int ipc_sock, const guest_t *g, bool use_shm);
+/* Caller holds mmap_lock, so the region table this walks stays the one the
+ * header and region snapshot describe.
+ */
+int fork_ipc_send_memory_regions_locked(int ipc_sock,
+                                        const guest_t *g,
+                                        bool use_shm);
 int fork_ipc_recv_memory_regions(int ipc_fd, guest_t *g);
 
 int fork_ipc_send_fd_table(int ipc_sock);
@@ -149,9 +154,7 @@ int fork_ipc_recv_pty_keepalives(int ipc_fd);
 int fork_ipc_send_process_state(int ipc_sock,
                                 const guest_region_t *regions_snapshot,
                                 uint32_t num_guest_regions,
-                                bool regions_tracker_stale_snapshot,
-                                const guest_region_t *preannounced_snapshot,
-                                uint32_t num_preannounced);
+                                bool regions_tracker_stale_snapshot);
 int fork_ipc_recv_process_state(int ipc_fd,
                                 guest_t *g,
                                 signal_state_snapshot_t *sig);

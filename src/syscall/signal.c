@@ -62,6 +62,7 @@
 
 #include "hvutil.h"
 
+#include "core/host-sigbus.h"
 #include "core/shim-globals.h"
 #include "core/vdso.h"
 
@@ -212,10 +213,10 @@ static void host_sigbus_install_once(void)
     sa.sa_sigaction = host_sigbus_handler;
     sigemptyset(&sa.sa_mask);
 
-    /* SA_NODEFER keeps SIGBUS unblocked inside the handler so the recovery pad
-     * can use the mask-free _setjmp/_longjmp pair. Without it the mask saved by
-     * sigsetjmp would be the only way back to an unblocked state, at the cost
-     * of two sigprocmask traps per guest memory copy.
+    /* SA_NODEFER is not what makes the mask-free _setjmp/_longjmp pair safe:
+     * the handler returns normally, so the kernel restores the interrupted mask
+     * before host_sigbus_resume runs. It only keeps SIGBUS unblocked while the
+     * handler itself runs.
      */
     sa.sa_flags = SA_SIGINFO | SA_NODEFER;
     if (sigaction(SIGBUS, &sa, &host_sigbus_prev) < 0)

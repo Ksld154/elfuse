@@ -41,16 +41,13 @@
 #include <unistd.h>
 
 #include "core/guest.h"
+#include "core/host-sigbus.h"
 #include "proved/align.h"
 #include "proved/gva.h"
 #include "core/startup-trace.h"
 #include "debug/log.h"
 #include "utils.h"
-#include "runtime/futex.h"  /* futex_interrupt_request */
-#include "runtime/thread.h" /* thread_destroy_all_vcpus */
-#include "syscall/proc.h"   /* proc_request_exit_group */
-#include "syscall/signal.h"
-#include "syscall/wakeup-pipe.h"
+#include "syscall/linux-wire.h" /* LINUX_MAP_*, LINUX_PROT_* */
 
 /* Per-vCPU pending TLBI request. Zero-initialized in every host pthread by
  * virtue of TLS default-zeroing, which maps to TLBI_NONE.
@@ -165,9 +162,10 @@ static int desc_to_perms(uint64_t desc);
 /* Page table pool allocator. */
 
 /* Protects the page table pool bump allocator. Multiple threads may trigger
- * page table extension concurrently (via mmap/brk/mprotect).
+ * page table extension concurrently (via mmap/brk/mprotect). Ordering: see the
+ * lock-ordering block in syscall/internal.h.
  */
-static pthread_mutex_t pt_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 2 */
+static pthread_mutex_t pt_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Track whether the 80% warning has been emitted (avoid log spam) */
 static _Atomic bool pt_pool_warned = false;
@@ -780,69 +778,6 @@ static void release_extra_mappings(guest_t *g)
 
 void guest_destroy(guest_t *g)
 {
-    /* Quiesce worker vCPUs before unmapping stage-2. thread_destroy_all_vcpus
-     * only releases vCPU handles; it does not wait for the owning pthread to
-     * leave hv_vcpu_run. A worker still inside the guest at unmap time takes a
-     * stage-2 translation fault on its next instruction fetch and surfaces as
-     * "unexpected exception EC=0x20" in the crash report. The foot terminal
-     * reproduction tripped exactly that race. On the exit_group path the
-     * syscall handler runs request and interrupt, and main() joins the workers
-     * after its run loop returns; the destroy path needs the full
-     * request-interrupt-join sequence here because forkipc.c:vcpu_run_loop
-     * returns straight into guest_destroy without going through the guest
-     * exit_group handler or main()'s teardown. The request is guarded on the
-     * prior state so a process that already chose its exit code keeps it
-     * intact.
-     *
-     * The wake signals cover workers blocked outside hv_vcpu_run: futex waiters
-     * poll futex_interrupt_requested, any thread parked in epoll or poll wakes
-     * off the shared pipe, and thread_wake_exit_waiters broadcasts the internal
-     * condvars (fork barrier, ptrace stop/wait). Without them, host-blocked
-     * workers miss the hv_vcpus_exit kick (which only affects threads inside
-     * hv_vcpu_run) and the 100ms join cap in thread_join_workers detaches them,
-     * leaving live pthreads to crash on the imminent munmap.
-     */
-    if (!proc_exit_group_requested())
-        proc_request_exit_group(0);
-    thread_wake_all_blocked();
-    thread_join_workers();
-
-    /* Destroy the main vCPU (owned by this thread) before tearing down the VM.
-     * Worker vCPUs are never destroyed cross-thread here; if thread join timed
-     * out and one is still live, thread_destroy_all_vcpus reports it via
-     * live_workers so teardown is deferred to process exit.
-     */
-    bool live_workers = false;
-    bool main_vcpu_destroyed =
-        thread_destroy_all_vcpus(g->vcpu, g->vcpu_valid, &live_workers);
-    if (live_workers) {
-        /* A worker did not stop within the join cap and is still live on its
-         * own thread. HVF vCPUs are thread-affine, so neither a cross-thread
-         * hv_vcpu_destroy nor hv_vm_destroy / munmap of the slab may run while
-         * that worker holds a live vCPU without corrupting kernel state and
-         * panicking the host. guest_destroy is always terminal -- main() and
-         * the fork-child return straight into process exit after it -- so leave
-         * the VM, its vCPUs, and the slab in place and let process teardown
-         * reclaim them atomically, the one operation that safely stops a
-         * foreign vCPU. The leaked fds and heap are reclaimed the same way.
-         */
-        log_warn(
-            "guest_destroy: worker vCPU still live past join cap; "
-            "deferring HVF teardown to process exit");
-
-        /* thread_destroy_all_vcpus already destroyed the main vCPU (owned by
-         * this thread); clear the handle so no stale g->vcpu_valid survives the
-         * early return even though the rest of teardown is deferred.
-         */
-        g->vcpu_valid = false;
-        g->vcpu = 0;
-        return;
-    }
-    if (g->vcpu_valid && !main_vcpu_destroyed)
-        hv_vcpu_destroy(g->vcpu);
-    g->vcpu_valid = false;
-    g->vcpu = 0;
-
     /* Unmap each HVF segment. hv_vm_destroy releases all stage-2 state
      * regardless, but unmapping explicitly keeps invariants clean for
      * downstream tools (Instruments, leak detectors).
@@ -870,7 +805,6 @@ void guest_destroy(guest_t *g)
         }
     }
     g->nregions = 0;
-    g->npreannounced = 0;
     /* Close the shm fd if guest memory owns one (parent with shm backing) */
     if (g->shm_fd >= 0) {
         close(g->shm_fd);
@@ -1013,40 +947,6 @@ const guest_overflow_t *guest_find_overflow(const guest_t *g, uint64_t gpa)
             return o;
     }
     return NULL;
-}
-
-bool guest_is_valid_range(const guest_t *g, uint64_t gpa, uint64_t len)
-{
-    if (!g)
-        return false;
-    if (len == 0)
-        return true;
-    uint64_t end = gpa + len;
-    if (end < gpa) /* arithmetic overflow */
-        return false;
-
-    /* Primary buffer covers [0, guest_size). */
-    if (end <= g->guest_size)
-        return true;
-
-    /* For an extra-region or overflow match the WHOLE range must live inside a
-     * single region; host pointers cannot safely span discontiguous backing.
-     * gpa must be the entry point of that lookup so a straddling range (primary
-     * plus extra, or extra plus extra) is rejected.
-     */
-    if (gpa >= g->guest_size) {
-        for (int i = 0; i < g->n_mappings; i++) {
-            const guest_mapping_t *m = &g->mappings[i];
-            if (gpa >= m->gpa && end <= m->gpa + m->size)
-                return true;
-        }
-        for (int i = 0; i < g->noverflow; i++) {
-            const guest_overflow_t *o = &g->overflow[i];
-            if (gpa >= o->ipa_start && end <= o->ipa_start + o->size)
-                return true;
-        }
-    }
-    return false;
 }
 
 uint64_t guest_overflow_alloc(guest_t *g)
@@ -2348,38 +2248,6 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
     return 0;
 }
 
-int guest_preannounce(guest_t *g,
-                      uint64_t start,
-                      uint64_t end,
-                      int prot,
-                      int flags,
-                      uint64_t offset,
-                      const char *name)
-{
-    if (g->npreannounced >= GUEST_MAX_PREANNOUNCED)
-        return -1;
-
-    int i = g->npreannounced;
-    while (i > 0 && g->preannounced[i - 1].start > start) {
-        g->preannounced[i] = g->preannounced[i - 1];
-        i--;
-    }
-
-    guest_region_t *r = &g->preannounced[i];
-    memset(r, 0, sizeof(*r));
-    r->start = start;
-    r->end = end;
-    r->gpa_base = start;
-    r->prot = prot;
-    r->flags = flags;
-    r->offset = offset;
-    r->backing_fd = -1;
-    if (name)
-        str_copy_trunc(r->name, name, sizeof(r->name));
-    g->npreannounced++;
-    return 0;
-}
-
 int guest_region_remove_prepare(guest_t *g,
                                 uint64_t start,
                                 uint64_t end,
@@ -2733,7 +2601,6 @@ static void guest_region_clear(guest_t *g)
         }
     }
     g->nregions = 0;
-    g->npreannounced = 0;
 
     /* The flag describes the table being discarded here, so it goes with it:
      * execve rebuilds a complete one, and carrying the doubt across meant a new

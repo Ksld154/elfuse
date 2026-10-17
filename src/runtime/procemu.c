@@ -19,8 +19,7 @@
  * enumerate every tracked VMA while keeping transient snapshot memory bounded.
  */
 #define MAPS_ENTRY_INITIAL_CAP 64
-#define MAPS_ENTRY_MAX \
-    (GUEST_MAX_REGIONS + GUEST_MAX_PREANNOUNCED * (GUEST_MAX_REGIONS + 1))
+#define MAPS_ENTRY_MAX GUEST_MAX_REGIONS
 
 /* Bound the transient host-PID snapshot used by /proc/net enumeration. This is
  * an output-work limit, not the dynamically growing lifecycle-table cap.
@@ -106,13 +105,6 @@ typedef struct {
     uint64_t offset;
     bool inherited_at_fork;
     char name[64];
-
-    /* Preserve the producer order for equal-start entries when qsort() is used
-     * below. Existing snapshots placed equal-start entries after one another in
-     * append order, and keeping that order avoids changing the handling of
-     * malformed/overlapping shadow metadata.
-     */
-    size_t order;
 } maps_entry_t;
 
 /* A growable VMA snapshot. The generated facade keeps element-size and
@@ -131,24 +123,6 @@ static uint64_t maps_align_up_page(uint64_t value)
     if (value > UINT64_MAX - mask)
         return UINT64_MAX;
     return (value + mask) & ~mask;
-}
-
-/* Translate a shadow VMA's cursor into its file offset. A wrapped offset would
- * produce a syntactically valid but semantically wrong maps entry, so surface
- * the overflow to the intercepted open instead.
- */
-static int maps_shadow_offset(const guest_region_t *shadow,
-                              uint64_t shadow_start,
-                              uint64_t cursor,
-                              uint64_t *offset_out)
-{
-    uint64_t delta = cursor - shadow_start;
-    if (delta > UINT64_MAX - shadow->offset) {
-        errno = EOVERFLOW;
-        return -1;
-    }
-    *offset_out = shadow->offset + delta;
-    return 0;
 }
 
 static int maps_entries_append_entry(maps_entries_t *entries,
@@ -177,7 +151,6 @@ static int maps_entries_append_entry(maps_entries_t *entries,
         .flags = flags,
         .offset = offset,
         .inherited_at_fork = inherited_at_fork,
-        .order = maps_entries_count(entries),
     };
     if (name && name[0])
         str_copy_trunc(value.name, name, sizeof(value.name));
@@ -185,104 +158,6 @@ static int maps_entries_append_entry(maps_entries_t *entries,
         value.name[0] = '\0';
 
     return maps_entries_append_value(entries, value);
-}
-
-/* The live-region and shadow-gap producers are each ordered, but their outputs
- * interleave. Append both streams while holding mmap_lock and sort once after
- * all gaps have been generated. This avoids shifting an already populated array
- * for every split shadow gap (the old insertion path was quadratic for
- * fragmented snapshots).
- */
-static int maps_entries_compare_start(const void *lhs, const void *rhs)
-{
-    const maps_entry_t *a = lhs;
-    const maps_entry_t *b = rhs;
-    if (a->start < b->start)
-        return -1;
-    if (a->start > b->start)
-        return 1;
-    if (a->order < b->order)
-        return -1;
-    if (a->order > b->order)
-        return 1;
-    return 0;
-}
-
-static void maps_entries_merge_adjacent(maps_entries_t *entries)
-{
-    size_t count = maps_entries_count(entries);
-    if (count <= 1)
-        return;
-
-    size_t out = 0;
-    for (size_t i = 1; i < count; i++) {
-        maps_entry_t *current = maps_entries_at(entries, i);
-        maps_entry_t *previous = maps_entries_at(entries, out);
-        if (current->start == previous->end &&
-            current->prot == previous->prot &&
-            current->flags == previous->flags &&
-            current->offset == previous->offset &&
-            current->inherited_at_fork == previous->inherited_at_fork &&
-            strcmp(current->name, previous->name) == 0) {
-            previous->end = current->end;
-            continue;
-        }
-        ++out;
-        if (out != i)
-            *maps_entries_at(entries, out) = *current;
-    }
-    (void) maps_entries_resize(entries, out + 1);
-}
-
-/* Add only the portions of a preannounced interval not covered by live VMAs. A
- * shadow VMA must never overlap a realized VMA: strict smaps consumers treat
- * overlapping headers as a malformed snapshot. Both inputs are page-rounded
- * because that is the granularity exposed by /proc/self/maps.
- */
-static int maps_entries_append_shadow_gaps(maps_entries_t *entries,
-                                           const guest_region_t *shadow,
-                                           const guest_region_t *live_regions,
-                                           int nlive)
-{
-    uint64_t shadow_start = shadow->start & ~0xFFFULL;
-    uint64_t shadow_end = maps_align_up_page(shadow->end);
-    if (shadow_end <= shadow_start)
-        return 0;
-
-    uint64_t cursor = shadow_start;
-    for (int i = 0; i < nlive && cursor < shadow_end; i++) {
-        uint64_t live_start = live_regions[i].start & ~0xFFFULL;
-        uint64_t live_end = maps_align_up_page(live_regions[i].end);
-        if (live_end <= live_start || live_end <= cursor)
-            continue;
-        if (live_start >= shadow_end)
-            break;
-
-        if (live_start > cursor) {
-            uint64_t gap_end =
-                live_start < shadow_end ? live_start : shadow_end;
-            uint64_t offset;
-            if (maps_shadow_offset(shadow, shadow_start, cursor, &offset) < 0)
-                return -1;
-            if (maps_entries_append_entry(
-                    entries, cursor, gap_end, shadow->prot, shadow->flags,
-                    offset, shadow->name, shadow->inherited_at_fork) < 0)
-                return -1;
-        }
-        if (live_end > cursor)
-            cursor = live_end;
-    }
-
-    if (cursor < shadow_end) {
-        uint64_t offset;
-        if (maps_shadow_offset(shadow, shadow_start, cursor, &offset) < 0)
-            return -1;
-        if (maps_entries_append_entry(entries, cursor, shadow_end, shadow->prot,
-                                      shadow->flags, offset, shadow->name,
-                                      shadow->inherited_at_fork) < 0)
-            return -1;
-    }
-    return 0;
 }
 
 /* Synthetic /sys/devices/system/cpu directory backing store. Populated lazily
@@ -1714,16 +1589,13 @@ static void proc_task_collect_cb(thread_entry_t *t, void *arg)
 }
 
 
-/* Build the VMA list shared by /proc/self/maps and /proc/self/smaps. Merges
- * contiguous regions[] runs that came from one mmap, then folds in the
- * uncovered pieces of preannounced[] shadow entries around live coverage.
- * Producers append entries while the lock is held; one sort/merge pass puts the
- * interleaved live and shadow streams back into VMA order.
+/* Build the VMA list shared by /proc/self/maps and /proc/self/smaps, merging
+ * contiguous regions[] runs that came from one mmap.
  *
- * The region and preannounced arrays are mutable from guest mmap/mprotect/
- * munmap operations. Snapshot and merge while mmap_lock is held, then release
- * it before formatting output so readers never observe a torn VMA or metadata
- * record and output generation does not block page-table mutations.
+ * The region array is mutable from guest mmap/mprotect/munmap operations.
+ * Snapshot and merge while mmap_lock is held, then release it before formatting
+ * output so readers never observe a torn VMA or metadata record and output
+ * generation does not block page-table mutations.
  */
 static int proc_build_maps_entries(const guest_t *g,
                                    maps_entries_t *entries_out)
@@ -1768,26 +1640,6 @@ static int proc_build_maps_entries(const guest_t *g,
             goto out_unlock;
     }
 
-    /* Add only uncovered portions of each preannounced interval. Keeping the
-     * shadow VMA whole when a live mapping realizes its middle produces
-     * overlapping maps/smaps headers; subtract every covered live interval
-     * instead, preserving any reserved-but-not-realized gaps.
-     */
-    int npreannounced = g->npreannounced;
-    if (npreannounced < 0)
-        npreannounced = 0;
-    if (npreannounced > GUEST_MAX_PREANNOUNCED)
-        npreannounced = GUEST_MAX_PREANNOUNCED;
-    for (int i = 0; i < npreannounced; i++) {
-        const guest_region_t *r = &g->preannounced[i];
-        if (maps_entries_append_shadow_gaps(&entries, r, g->regions, nregions) <
-            0)
-            goto out_unlock;
-    }
-    if (maps_entries_count(&entries) > 1)
-        qsort(maps_entries_data(&entries), maps_entries_count(&entries),
-              sizeof(maps_entry_t), maps_entries_compare_start);
-    maps_entries_merge_adjacent(&entries);
     result = (int) maps_entries_count(&entries);
 
 out_unlock:

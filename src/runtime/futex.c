@@ -31,6 +31,7 @@
 
 #include "utils.h"
 
+#include "core/host-sigbus.h"
 #include "core/shim-globals.h"
 #include "runtime/futex.h"
 #include "runtime/thread.h"

@@ -18,7 +18,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdatomic.h>
-#include <setjmp.h>
 #include <signal.h>
 #include <sys/time.h>
 #include "core/guest.h"
@@ -336,47 +335,8 @@ static inline void pending_clear(_Atomic uint64_t *p, uint64_t bits)
 
 /* API */
 
-typedef struct {
-    jmp_buf env;
-    volatile sig_atomic_t armed;
-} host_sigbus_recovery_t;
-
 /* Initialize signal state: all SIG_DFL, nothing pending/blocked. */
 void signal_init(void);
-
-/* Arm per-thread host SIGBUS recovery for direct guest memory copies. */
-host_sigbus_recovery_t *signal_host_sigbus_recovery(void);
-
-/* Run the trailing statement with host SIGBUS recovery armed for this thread,
- * setting faulted to true when it took a fault instead of killing the host.
- *
- * A MAP_SHARED overlay stays live in the guest slab after anything truncates
- * the file, so a host access to the vanished page raises SIGBUS. Only host user
- * mode needs this; kernel copyin/copyout reports EFAULT instead. SA_NODEFER on
- * the handler is what lets the mask-free _setjmp serve here.
- *
- * Rules for the statement, worst breakage first:
- * - No return, break, goto, or longjmp out. That skips the disarm and leaves
- *   env naming a dead frame, so the next fault jumps into freed stack.
- * - No lock, including one inside a callee: arc4random_buf here stranded a libc
- *   lock and hung the next fork. Keep to memcpy, memchr, atomic builtins.
- * - No result in a non-volatile local read when faulted; _longjmp leaves those
- *   indeterminate.
- * - No nesting: an inner guard disarms the outer on exit.
- */
-#define HOST_SIGBUS_GUARD(faulted, ...)                               \
-    do {                                                              \
-        host_sigbus_recovery_t *hsr_ = signal_host_sigbus_recovery(); \
-        if (_setjmp(hsr_->env) != 0) {                                \
-            signal_host_sigbus_recovery()->armed = 0;                 \
-            (faulted) = true;                                         \
-        } else {                                                      \
-            hsr_->armed = 1;                                          \
-            __VA_ARGS__;                                              \
-            hsr_->armed = 0;                                          \
-            (faulted) = false;                                        \
-        }                                                             \
-    } while (0)
 
 /* Reset signal state for exec (POSIX requirement). Handlers set to SIG_DFL
  * (except SIG_IGN stays SIG_IGN). Pending signals and signal mask are
