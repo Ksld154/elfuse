@@ -38,8 +38,8 @@
 
 /* Mutex protecting timerfd/eventfd/signalfd per-slot state. Prevents races when
  * two threads operate on the same special FD concurrently (e.g., two threads
- * reading the same eventfd). Lock order: 5a (after thread_lock(5), never held
- * together with it).
+ * reading the same eventfd). Never held together with thread_lock; the order
+ * block in internal.h places it.
  */
 static pthread_mutex_t sfd_lock = PTHREAD_MUTEX_INITIALIZER;
 

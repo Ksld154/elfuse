@@ -110,8 +110,8 @@ typedef struct {
 static inotify_instance_t inotify_state[INOTIFY_MAX];
 
 /* Mutex protecting inotify_state[] for concurrent access. Two guest threads may
- * create/close/add-watch on different inotify instances simultaneously. Lock
- * order: 7 (after pid_lock).
+ * create/close/add-watch on different inotify instances simultaneously. Its
+ * place in the lock order is in the block at the top of internal.h.
  */
 static pthread_mutex_t inotify_lock = PTHREAD_MUTEX_INITIALIZER;
 

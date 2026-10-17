@@ -88,7 +88,7 @@ static _Atomic bool rosetta_active = false;
 static proc_entry_t proc_table_initial[PROC_TABLE_INITIAL_CAPACITY];
 static proc_entry_t *proc_table = proc_table_initial;
 static size_t proc_table_capacity = PROC_TABLE_INITIAL_CAPACITY;
-static pthread_mutex_t pid_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 6 */
+static pthread_mutex_t pid_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t autoreap_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t pid_cond =
     PTHREAD_COND_INITIALIZER; /* Signaled on child exit */
