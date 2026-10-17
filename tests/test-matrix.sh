@@ -920,6 +920,8 @@ run_unit_tests()
 
     printf "\nPI futex + EINTR regression\n"
     test_check "$runner" "test-futex-pi" "0 failed" "$bindir/test-futex-pi"
+    test_check "$runner" "test-futex-pi-mutex" "0 failed" \
+        "$bindir/test-futex-pi-mutex"
     test_rc "$runner" "test-futex-waitv" 0 "$bindir/test-futex-waitv"
     test_rc "$runner" "test-futex-wake-op" 0 "$bindir/test-futex-wake-op"
     test_check "$runner" "test-futex-timed" "0 failed" \

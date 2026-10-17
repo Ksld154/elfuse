@@ -672,6 +672,11 @@ $(BUILD_DIR)/test-fuse-basic: tests/test-fuse-basic.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+# test-futex-pi-mutex contends one PI mutex from three threads
+$(BUILD_DIR)/test-futex-pi-mutex: tests/test-futex-pi-mutex.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # test-sysv-msg-wait parks a thread in msgrcv while a sibling exits or execs
 $(BUILD_DIR)/test-sysv-msg-wait: tests/test-sysv-msg-wait.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"

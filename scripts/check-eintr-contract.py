@@ -333,8 +333,8 @@ INVENTORY = {
     ),
     "runtime/futex.c::futex_lock_pi_inner": (
         "restartable",
-        "The deadline is absolute and futex_unlock_pi zeroes the word rather "
-        "than transferring ownership, so a restart re-CASes.",
+        "The deadline is absolute and futex_unlock_pi releases the word "
+        "without transferring ownership, so a restart re-CASes.",
     ),
     "runtime/futex.c::sys_futex_waitv": (
         "restartable",
