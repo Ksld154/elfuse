@@ -14,12 +14,13 @@
 
 #include "core/guest.h"
 #include "syscall/linux-wire.h"
+#include "syscall/proc-pidfd.h"
 #include "syscall/signal.h"
 
 /* Fork IPC protocol identity. Bump this whenever the header layout or ordered
  * fork payload changes incompatibly.
  */
-#define FORK_IPC_PROTOCOL_MAGIC 0x454C4651U /* "ELFQ" */
+#define FORK_IPC_PROTOCOL_MAGIC 0x454C4652U /* "ELFR" */
 
 #define IPC_MAGIC_HEADER FORK_IPC_PROTOCOL_MAGIC
 #define IPC_MAGIC_SENTINEL 0x454C4F4BU /* "ELOK" */
@@ -123,6 +124,12 @@ typedef struct {
      */
     int32_t foreign_description, nonblock_owned, path_poll_capable;
     char proc_path[FD_VIRTUAL_PATH_MAX];
+
+    /* FD_PIDFD only: the target a pidfd names lives in the parent's registry,
+     * not in the pipe that travels over SCM_RIGHTS, so the child rebuilds the
+     * description from this rather than from the descriptor.
+     */
+    pidfd_fork_state_t pidfd;
 } ipc_fd_entry_t;
 
 int fork_ipc_write_all(int fd, const void *buf, size_t len);
@@ -130,7 +137,12 @@ int fork_ipc_read_all(int fd, void *buf, size_t len);
 int fork_ipc_send_fds(int sock, const int *fds, int count);
 int fork_ipc_recv_fds(int sock, int *fds, int max_count, int *out_count);
 
-int fork_ipc_send_memory_regions(int ipc_sock, const guest_t *g, bool use_shm);
+/* Caller holds mmap_lock, so the region table this walks stays the one the
+ * header and region snapshot describe.
+ */
+int fork_ipc_send_memory_regions_locked(int ipc_sock,
+                                        const guest_t *g,
+                                        bool use_shm);
 int fork_ipc_recv_memory_regions(int ipc_fd, guest_t *g);
 
 int fork_ipc_send_fd_table(int ipc_sock);
@@ -149,9 +161,7 @@ int fork_ipc_recv_pty_keepalives(int ipc_fd);
 int fork_ipc_send_process_state(int ipc_sock,
                                 const guest_region_t *regions_snapshot,
                                 uint32_t num_guest_regions,
-                                bool regions_tracker_stale_snapshot,
-                                const guest_region_t *preannounced_snapshot,
-                                uint32_t num_preannounced);
+                                bool regions_tracker_stale_snapshot);
 int fork_ipc_recv_process_state(int ipc_fd,
                                 guest_t *g,
                                 signal_state_snapshot_t *sig);

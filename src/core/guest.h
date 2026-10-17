@@ -225,13 +225,6 @@ typedef struct {
  */
 #define GUEST_MAX_REGIONS 4096
 
-/* Preannounced regions appear only in /proc/self/maps and are NOT consulted by
- * mmap / mprotect / munmap conflict checks. Used for runtimes such as Rosetta
- * that snapshot a code map from /proc/self/maps before they reserve or remap
- * their own address ranges via MAP_FIXED_NOREPLACE.
- */
-#define GUEST_MAX_PREANNOUNCED 16
-
 /* HVF stage-2 mapping segment. The slab is mapped to HVF in pieces so that
  * file-backed MAP_SHARED regions can have real host-VA overlays applied via
  * mmap MAP_FIXED|MAP_SHARED of a file fd. HVF requires hv_vm_unmap to target an
@@ -561,8 +554,6 @@ typedef struct {
      * doubts, so it binds this image rather than the process.
      */
     bool regions_tracker_stale;
-    guest_region_t preannounced[GUEST_MAX_PREANNOUNCED];
-    int npreannounced; /* /proc/self/maps-only shadow regions */
 
     /* HVF stage-2 segment list: the union of segments[0..n_segments) covers the
      * live IPA range that is currently hv_vm_map'd to HVF. Sorted by ipa.
@@ -889,14 +880,9 @@ int guest_init_from_shm(guest_t *g,
                         uint32_t ipa_bits,
                         bool retain_shared);
 
-/* Tear down VM and free guest memory. Must be terminal: the caller has to
- * proceed straight to process exit afterwards. If a worker vCPU is still live
- * past the join cap, HVF teardown cannot run safely, so guest_destroy leaks the
- * VM and slab for process exit to reclaim -- and macOS allows only one VM per
- * process, so a non-terminal caller would both leak and fail to bring up a
- * second VM. All current callers (main() cleanup, the fork-child run loop)
- * satisfy this. Remaining host-side cleanup (mounts, heap) is still safe to run
- * after a deferred teardown: it never touches HVF or guest memory.
+/* Tear down VM and free guest memory. The caller has already destroyed every
+ * vCPU, which is what launch_destroy_guest in core/launch.h does before calling
+ * this.
  */
 void guest_destroy(guest_t *g);
 
@@ -958,20 +944,6 @@ uint64_t guest_overflow_alloc(guest_t *g);
  * Returns NULL if gpa is not within any overflow segment.
  */
 const guest_overflow_t *guest_find_overflow(const guest_t *g, uint64_t gpa);
-
-/* Returns true when [gpa, gpa+len) is fully contained within the primary
- * buffer, OR fully contained within a single extra mapping, OR fully contained
- * within a single overflow segment. The check rejects ranges that straddle
- * region boundaries -- host pointers cannot safely span discontiguous backing
- * regions. len == 0 returns true (zero-length ranges are well-formed by
- * convention; syscall handlers that disallow them check separately).
- *
- * Use this for syscalls that need to validate a guest IPA range without
- * coupling to the primary-buffer-only assumption: sys_mmap MAP_FIXED,
- * sys_munmap, sys_mremap, sys_mprotect, sys_msync, and any future caller that
- * handles rosetta high-VA traffic.
- */
-bool guest_is_valid_range(const guest_t *g, uint64_t gpa, uint64_t len);
 
 /* Initialize the TTBR1 kbuf window. kbuf_gpa must be 2 MiB-aligned and the
  * [kbuf_gpa, kbuf_gpa + KBUF_SIZE) range must lie within the primary buffer.
@@ -1328,24 +1300,6 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
  * serialized lineage before child-private mappings are added.
  */
 void guest_reseed_next_vma_id(guest_t *g);
-
-/* Add a preannounced region that appears in /proc/self/maps only. These entries
- * are kept separate from regions[] so they do not cause -EEXIST on guest
- * MAP_FIXED_NOREPLACE reservations.
- *
- * No producer wires this up today. The storage, fork-IPC, and /proc/self/maps
- * consumer are kept as scaffolding for runtimes that consult /proc/self/maps
- * before reserving VA ranges. Preannouncing the x86_64 image during Rosetta
- * bring-up was tried and rejected: it perturbed Rosetta's internal allocation
- * tracker. The hook stays until a workload needs an advertise-only entry.
- */
-int guest_preannounce(guest_t *g,
-                      uint64_t start,
-                      uint64_t end,
-                      int prot,
-                      int flags,
-                      uint64_t offset,
-                      const char *name);
 
 /* Reserve any backing fd needed by an interior split in [start, end). The
  * reservation must be consumed by guest_region_remove_reserved().

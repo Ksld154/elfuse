@@ -61,19 +61,21 @@ void mem_cleanup_deferred_stack_unmaps(guest_t *g, thread_entry_t *t);
  * a dup of the temp file so the regular SCM_RIGHTS handover feeds the child a
  * coherent fd.
  *
- * Caller must already hold sibling vCPUs quiesced. mmap_lock is acquired
- * internally. Per-region failures are logged and skipped (snapshot fallback
- * persists for those regions); structural failure returns -errno. Regions whose
- * start address is not host-page-aligned are skipped (overlay-eligibility
- * requirement). On success, *txn_out owns rollback metadata that must later be
- * committed or aborted.
+ * Caller must already hold sibling vCPUs quiesced and must hold mmap_lock, so
+ * the fork that follows reads the same region table this converted. Per-region
+ * failures are logged and skipped (snapshot fallback persists for those
+ * regions); structural failure returns -errno. Regions whose start address is
+ * not host-page-aligned are skipped (overlay-eligibility requirement). On
+ * success, *txn_out owns rollback metadata that must later be committed or
+ * aborted.
  */
-int mmap_fork_prepare_anon_shared(guest_t *g,
-                                  mmap_fork_anon_shared_txn_t **txn_out);
+int mmap_fork_prepare_anon_shared_locked(guest_t *g,
+                                         mmap_fork_anon_shared_txn_t **txn_out);
 
-/* Finalize or roll back mmap_fork_prepare_anon_shared(). Callers must still
- * have sibling vCPUs quiesced when aborting so the host overlay removal cannot
- * race guest accesses.
+/* Finalize or roll back mmap_fork_prepare_anon_shared_locked(). Callers must
+ * still have sibling vCPUs quiesced when aborting so the host overlay removal
+ * cannot race guest accesses. Abort takes mmap_lock itself, so the caller
+ * releases it first.
  */
 void mmap_fork_commit_anon_shared(mmap_fork_anon_shared_txn_t **txn_ptr);
 int mmap_fork_abort_anon_shared(guest_t *g,

@@ -54,6 +54,7 @@ _Static_assert(NAME_MAX == DIRENT64_NAME_MAX,
 #include "syscall/usbdev.h"
 #include "syscall/poll.h" /* epoll_dup_fd */
 #include "syscall/proc.h"
+#include "syscall/proc-pidfd.h" /* pidfd_pin */
 
 /* Linux dirent64 layout. */
 typedef struct {
@@ -1364,6 +1365,23 @@ static int duplicate_guest_fd(int src_fd,
         return -1;
     }
 
+    /* The pidfd registry is keyed by description, and the source's close can
+     * land before the alias is published; the pin keeps the entry alive across
+     * that window. Every live pidfd description has an entry, bound before its
+     * first slot was published, so a failed pin means the close already retired
+     * it.
+     */
+    bool pidfd_pinned = false;
+    if (src_snap.type == FD_PIDFD) {
+        if (!pidfd_pin(src_snap.ofd_id)) {
+            proc_pty_unlock_for_dup();
+            close(new_host_fd);
+            errno = EBADF;
+            return -1;
+        }
+        pidfd_pinned = true;
+    }
+
     /* Not for a shared directory descriptor: source and alias are the one
      * descriptor there, so there is no second reference for either table to
      * record, and registering a descriptor as its own duplicate would count it
@@ -1438,9 +1456,14 @@ static int duplicate_guest_fd(int src_fd,
             proc_pty_forget_host_fd(new_host_fd);
             close(new_host_fd);
         }
+        if (pidfd_pinned)
+            pidfd_unpin(src_snap.ofd_id);
         errno = saved_errno;
         return -1;
     }
+
+    if (pidfd_pinned)
+        pidfd_unpin(src_snap.ofd_id);
 
     /* A false return means a sibling reallocated the slot while the metadata
      * install was pending. Nothing to unwind: that sibling's close path already
@@ -1698,6 +1721,26 @@ static int64_t fcntl_flock_wait(guest_t *g,
     }
 }
 
+/* Pin fd's host descriptor for sys_fcntl, refusing with EBADF unless the slot
+ * still holds the open that snap describes. Every decision sys_fcntl makes is
+ * taken from snap, and a sibling's close+reopen between the snapshot and a
+ * plain host_fd_ref_open would apply them to an unrelated file.
+ */
+static int64_t fcntl_host_ref_open(int fd,
+                                   const fd_entry_t *snap,
+                                   host_fd_ref_t *ref)
+{
+    fd_entry_t now;
+    int64_t err = host_fd_ref_open_entry(fd, ref, &now);
+    if (err < 0)
+        return err;
+    if (now.generation != snap->generation) {
+        host_fd_ref_close(ref);
+        return -LINUX_EBADF;
+    }
+    return 0;
+}
+
 int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
@@ -1773,7 +1816,7 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
             return shadow_fl;
 
         host_fd_ref_t host_ref;
-        int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+        int64_t ref_err = fcntl_host_ref_open(fd, &fd_snap, &host_ref);
         if (ref_err < 0)
             return ref_err;
         int mac_fl = fcntl(host_ref.fd, F_GETFL);
@@ -1876,7 +1919,7 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
             return -LINUX_EINVAL;
 
         host_fd_ref_t host_ref;
-        int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+        int64_t ref_err = fcntl_host_ref_open(fd, &fd_snap, &host_ref);
         if (ref_err < 0)
             return ref_err;
 
@@ -1931,7 +1974,7 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
     case 6:   /* F_SETLK */
     case 7: { /* F_SETLKW */
         host_fd_ref_t host_ref;
-        int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+        int64_t ref_err = fcntl_host_ref_open(fd, &fd_snap, &host_ref);
         if (ref_err < 0)
             return ref_err;
         int mac_cmd = (cmd == 5) ? F_GETLK : (cmd == 6) ? F_SETLK : F_SETLKW;
@@ -1945,7 +1988,7 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
     case 37:   /* F_OFD_SETLK */
     case 38: { /* F_OFD_SETLKW */
         host_fd_ref_t host_ref;
-        int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+        int64_t ref_err = fcntl_host_ref_open(fd, &fd_snap, &host_ref);
         if (ref_err < 0)
             return ref_err;
         int mac_cmd = (cmd == 36)   ? F_OFD_GETLK
@@ -2063,7 +2106,7 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         return fd_table[fd].seals;
     case LINUX_F_ADD_SEALS: {
         host_fd_ref_t host_ref;
-        int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+        int64_t ref_err = fcntl_host_ref_open(fd, &fd_snap, &host_ref);
         if (ref_err < 0)
             return ref_err;
         int cur = fd_table[fd].seals;
@@ -3618,22 +3661,21 @@ int64_t sys_faccessat(guest_t *g,
 
 int64_t sys_ftruncate(int fd, int64_t length)
 {
-    fd_entry_t snap;
-    if (!fd_snapshot(fd, &snap))
-        return -LINUX_EBADF;
-    /* Linux: ftruncate on an O_PATH fd returns EBADF. */
-    if (snap.type == FD_PATH)
-        return -LINUX_EBADF;
-
-    /* Enforce memfd seals on truncate. */
-    int seals = snap.seals;
-    if (seals & LINUX_F_SEAL_WRITE)
-        return -LINUX_EPERM;
-
+    /* One lookup for the type, the seals and the descriptor, so a sibling's
+     * close+reopen cannot pair one file's checks with another file's fd.
+     */
+    fd_block_state_t bst;
     host_fd_ref_t host_ref;
-    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+    int64_t ref_err = host_fd_ref_open_io_state(fd, &host_ref, NULL, &bst);
     if (ref_err < 0)
         return ref_err;
+
+    /* Enforce memfd seals on truncate. */
+    int seals = (int) bst.seals;
+    if (seals & LINUX_F_SEAL_WRITE) {
+        host_fd_ref_close(&host_ref);
+        return -LINUX_EPERM;
+    }
 
     if (seals & (LINUX_F_SEAL_SHRINK | LINUX_F_SEAL_GROW)) {
         struct stat st;
@@ -3697,14 +3739,33 @@ int64_t sys_truncate(guest_t *g, uint64_t path_gva, int64_t length)
 
 /* permissions/ownership. */
 
+/* Pin dirfd for an AT_EMPTY_PATH operation on the descriptor itself, refusing
+ * what fchmodat and fchownat both refuse there: a FUSE fd (no host file behind
+ * it to change) and an O_PATH fd onto a /proc name (Linux answers EPERM). The
+ * classification and the pin come from one lookup, so a sibling's close+reopen
+ * cannot apply one file's refusal and change another file.
+ *
+ * A FUSE file slot carries no host descriptor, so the pin itself fails on it;
+ * the type is asked again only to keep the ENOSYS such a slot always reported.
+ */
+static int64_t at_empty_path_ref_open(int dirfd, host_fd_ref_t *ref)
+{
+    fd_entry_t snap;
+    int64_t err = host_fd_ref_open_entry(dirfd, ref, &snap);
+    int type = err < 0 ? fd_get_type(dirfd) : snap.type;
+    if (type == FD_FUSE_DEV || type == FD_FUSE_FILE || type == FD_FUSE_DIR)
+        err = -LINUX_ENOSYS;
+    else if (err == 0 && snap.type == FD_PATH && snap.proc_path[0] != '\0')
+        err = -LINUX_EPERM;
+    if (err < 0)
+        host_fd_ref_close(ref);
+    return err;
+}
+
 int64_t sys_fchmod(int fd, uint32_t mode)
 {
-    /* O_PATH fds do not support fchmod (Linux returns EBADF) */
-    fd_entry_t snap;
-    if (fd_snapshot(fd, &snap) && snap.type == FD_PATH)
-        return -LINUX_EBADF;
     host_fd_ref_t host_ref;
-    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+    int64_t ref_err = host_fd_ref_open_io(fd, &host_ref);
     if (ref_err < 0)
         return ref_err;
     if (fchmod(host_ref.fd, mode) < 0) {
@@ -3728,8 +3789,8 @@ int64_t sys_fchmodat(guest_t *g,
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
-    /* AT_EMPTY_PATH with an empty path chmods dirfd itself; see the identical
-     * branch in sys_fchownat above for the O_PATH/AT_FDCWD rationale. Neither
+    /* AT_EMPTY_PATH with an empty path chmods dirfd itself; see the matching
+     * branch in sys_fchownat for the O_PATH/AT_FDCWD rationale. Neither
      * sub-case below goes through path_translate_at, so the FUSE and /proc
      * interception normally applied by reject_unsupported_fuse_path_op and
      * stat_at_path's proc_intercept_stat has to be checked by hand here.
@@ -3748,17 +3809,8 @@ int64_t sys_fchmodat(guest_t *g,
             return 0;
         }
 
-        fd_entry_t snap;
-        if (!fd_snapshot(dirfd, &snap))
-            return -LINUX_EBADF;
-        if (snap.type == FD_FUSE_DEV || snap.type == FD_FUSE_FILE ||
-            snap.type == FD_FUSE_DIR)
-            return -LINUX_ENOSYS;
-        if (snap.type == FD_PATH && snap.proc_path[0] != '\0')
-            return -LINUX_EPERM;
-
         host_fd_ref_t ref;
-        int64_t ref_err = host_dirfd_ref_open(dirfd, &ref);
+        int64_t ref_err = at_empty_path_ref_open(dirfd, &ref);
         if (ref_err < 0)
             return ref_err;
         if (fchmod(ref.fd, mode) < 0) {
@@ -3923,17 +3975,8 @@ int64_t sys_fchownat(guest_t *g,
             return out;
         }
 
-        fd_entry_t snap;
-        if (!fd_snapshot(dirfd, &snap))
-            return -LINUX_EBADF;
-        if (snap.type == FD_FUSE_DEV || snap.type == FD_FUSE_FILE ||
-            snap.type == FD_FUSE_DIR)
-            return -LINUX_ENOSYS;
-        if (snap.type == FD_PATH && snap.proc_path[0] != '\0')
-            return -LINUX_EPERM;
-
         host_fd_ref_t ref;
-        int64_t ref_err = host_dirfd_ref_open(dirfd, &ref);
+        int64_t ref_err = at_empty_path_ref_open(dirfd, &ref);
         if (ref_err < 0)
             return ref_err;
 
@@ -4036,12 +4079,8 @@ int64_t sys_fchownat(guest_t *g,
 
 int64_t sys_fchown(int fd, uint32_t owner, uint32_t group)
 {
-    /* O_PATH fds do not support fchown (Linux returns EBADF) */
-    fd_entry_t snap;
-    if (fd_snapshot(fd, &snap) && snap.type == FD_PATH)
-        return -LINUX_EBADF;
     host_fd_ref_t host_ref;
-    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+    int64_t ref_err = host_fd_ref_open_io(fd, &host_ref);
     if (ref_err < 0)
         return ref_err;
 

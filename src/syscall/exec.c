@@ -484,7 +484,7 @@ static bool exec_id_may_elevate(uint32_t physical,
     return physical == 0 || physical == self_id;
 }
 
-static int check_exec_permission(const struct stat *st)
+int exec_check_permission(const struct stat *st)
 {
     uint32_t uid = proc_get_euid();
     uint32_t gid = proc_get_egid();
@@ -683,7 +683,7 @@ static int64_t exec_preload_interp(const guest_t *g,
     }
     chown_overlay_apply(&interp_st);
 
-    int64_t err = check_exec_permission(&interp_st);
+    int64_t err = exec_check_permission(&interp_st);
     if (err < 0) {
         return err;
     }
@@ -1481,7 +1481,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     struct stat exec_st_seen = exec_st;
     chown_overlay_apply(&exec_st_seen);
 
-    err = check_exec_permission(&exec_st_seen);
+    err = exec_check_permission(&exec_st_seen);
     if (err < 0) {
         goto fail;
     }
@@ -1641,7 +1641,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
             goto fail;
         }
         chown_overlay_apply(&interp_st);
-        err = check_exec_permission(&interp_st);
+        err = exec_check_permission(&interp_st);
         if (err < 0) {
             goto fail;
         }

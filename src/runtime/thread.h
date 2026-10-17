@@ -129,8 +129,8 @@ typedef struct thread_entry {
                           */
     bool join_abandoned; /* thread_join_workers timed out on this worker and
                           * pthread_detach()ed it. Later join passes
-                          * (guest_destroy runs one after main()'s) must skip
-                          * the entry: pthread_join/pthread_detach on an
+                          * (launch_destroy_guest runs one after main()'s) must
+                          * skip the entry: pthread_join/pthread_detach on an
                           * already-detached thread is undefined.
                           */
     /* Per-thread signal mask lives at the top of the struct; see the lock-free
@@ -410,12 +410,13 @@ int thread_count_active_vm_clones(void);
  * join_abandoned by a prior pass). Collects thread handles under the lock, then
  * polls OUTSIDE the lock under one shared 500ms deadline so workers can call
  * thread_deactivate() to set active=0. Workers still alive past the deadline
- * are detached and marked join_abandoned so a later pass (e.g. guest_destroy's
- * internal join after main()'s) does not touch the same handle twice.
+ * are detached and marked join_abandoned so a later pass (e.g.
+ * launch_destroy_guest's internal join after main()'s) does not touch the same
+ * handle twice.
  */
 void thread_join_workers(void);
 
-/* Destroy the main vCPU (owned by the calling thread) during guest_destroy. HVF
+/* Destroy the main vCPU (owned by the calling thread) during teardown. HVF
  * vCPUs are thread-affine, so worker vCPUs are never destroyed here: an active
  * worker slot that has not published vm_exited is one whose owning thread is
  * still live -- running a vCPU or mid-bring-up about to enter one -- and a
@@ -443,7 +444,7 @@ void thread_interrupt_all(void);
 /* Wake every thread parked anywhere it cannot see a teardown flag: futex
  * waiters, poll/epoll/read parks on the wakeup pipe, vCPUs inside hv_vcpu_run,
  * and the internal condvars. The four wakes are always needed together, so
- * exit_group teardown (guest_destroy, main's run-loop exit) and execve
+ * exit_group teardown (launch_destroy_guest, main's run-loop exit) and execve
  * de_thread share this rather than each keeping its own list. Callers that mean
  * process teardown must set the exit-group flag first, per
  * thread_wake_exit_waiters below.
@@ -648,22 +649,9 @@ int thread_prepare_deferred_stack_unmaps_for_cleanup(thread_entry_t *t,
                                                      uint64_t *ends,
                                                      int max_ranges);
 
-/* Snapshot the deferred unmap entries without modifying the thread record.
- * Returns the number of entries copied (capped at max_ranges).
- */
-int thread_peek_deferred_stack_unmaps(thread_entry_t *t,
-                                      uint64_t *starts,
-                                      uint64_t *ends,
-                                      int max_ranges);
-
 /* Drop a single completed deferred unmap entry by exact [start, end) match.
  * Returns 1 if removed, 0 if no matching entry was found.
  */
 int thread_drop_deferred_stack_unmap(thread_entry_t *t,
                                      uint64_t start,
                                      uint64_t end);
-
-/* Forget the thread's stack range so future munmap calls do not enqueue new
- * deferred entries against this slot. Safe to call once the thread is dead.
- */
-void thread_clear_stack_map(thread_entry_t *t);

@@ -55,7 +55,6 @@ int64_t fuse_dev_write(guest_t *g,
                        uint64_t buf_gva,
                        uint64_t count);
 
-bool fuse_is_device_fd(int fd);
 bool fuse_is_file_fd(int fd);
 bool fuse_is_dir_fd(int fd);
 bool fuse_fd_refuse_mmap(int fd);

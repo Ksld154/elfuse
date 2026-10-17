@@ -58,6 +58,7 @@
 #include "hvutil.h"
 #include "utils.h"
 
+#include "core/launch.h"
 #include "core/shim-globals.h"
 
 #include "runtime/forkipc.h"
@@ -247,7 +248,7 @@ int fork_child_main(int ipc_fd,
         ((hdr.pt_pool_next - g.pt_pool_base) % GUEST_PAGE_SIZE) != 0) {
         log_error("fork-child: invalid pt_pool_next 0x%llx",
                   (unsigned long long) hdr.pt_pool_next);
-        guest_destroy(&g);
+        launch_destroy_guest(&g);
         close(ipc_fd);
         return 1;
     }
@@ -256,7 +257,7 @@ int fork_child_main(int ipc_fd,
         ((ttbr0_off - g.pt_pool_base) % GUEST_PAGE_SIZE) != 0) {
         log_error("fork-child: invalid ttbr0 0x%llx",
                   (unsigned long long) hdr.ttbr0);
-        guest_destroy(&g);
+        launch_destroy_guest(&g);
         close(ipc_fd);
         return 1;
     }
@@ -294,19 +295,19 @@ int fork_child_main(int ipc_fd,
     ipc_registers_t regs;
     if (fork_ipc_read_all(ipc_fd, &regs, sizeof(regs)) < 0) {
         log_error("fork-child: failed to read registers");
-        guest_destroy(&g);
+        launch_destroy_guest(&g);
         return 1;
     }
 
     if (fork_ipc_recv_memory_regions(ipc_fd, &g) < 0) {
         log_error("fork-child: failed to receive memory regions");
-        guest_destroy(&g);
+        launch_destroy_guest(&g);
         return 1;
     }
 
     if (fork_ipc_recv_fd_table(ipc_fd, &g) < 0) {
         log_error("fork-child: failed to receive fd table");
-        guest_destroy(&g);
+        launch_destroy_guest(&g);
         return 1;
     }
 
@@ -316,7 +317,7 @@ int fork_child_main(int ipc_fd,
      */
     if (sys_nofile_restore(hdr.nofile_cur, hdr.nofile_max) < 0) {
         log_error("fork-child: failed to restore RLIMIT_NOFILE");
-        guest_destroy(&g);
+        launch_destroy_guest(&g);
         return 1;
     }
 
@@ -325,7 +326,7 @@ int fork_child_main(int ipc_fd,
      */
     if (fork_ipc_recv_pty_keepalives(ipc_fd) < 0) {
         log_error("fork-child: failed to receive pty keepalives");
-        guest_destroy(&g);
+        launch_destroy_guest(&g);
         return 1;
     }
 
@@ -346,7 +347,7 @@ int fork_child_main(int ipc_fd,
         log_error("fork-child: failed to receive process state");
 
         proc_pty_release_process_slaves();
-        guest_destroy(&g);
+        launch_destroy_guest(&g);
         return 1;
     }
 
@@ -354,7 +355,7 @@ int fork_child_main(int ipc_fd,
         log_error("fork-child: failed to receive chown overlay");
 
         proc_pty_release_process_slaves();
-        guest_destroy(&g);
+        launch_destroy_guest(&g);
         return 1;
     }
 
@@ -370,7 +371,7 @@ int fork_child_main(int ipc_fd,
         log_error("fork-child: parent did not commit child admission");
 
         proc_pty_release_process_slaves();
-        guest_destroy(&g);
+        launch_destroy_guest(&g);
         return 1;
     }
 
@@ -426,7 +427,7 @@ int fork_child_main(int ipc_fd,
     if (shim_globals_install_per_vcpu(vcpu, &g, hdr.child_pid) < 0) {
         /* Give the pty credit back, as every bail below the adopt does. */
         proc_pty_release_process_slaves();
-        guest_destroy(&g);
+        launch_destroy_guest(&g);
         return 1;
     }
 
@@ -561,7 +562,7 @@ int fork_child_main(int ipc_fd,
      */
     proc_pty_release_process_slaves();
 
-    guest_destroy(&g);
+    launch_destroy_guest(&g);
     return exit_code;
 }
 
@@ -1734,9 +1735,9 @@ int64_t sys_clone(hv_vcpu_t vcpu,
 
     mmap_fork_anon_shared_txn_t *anon_shared_txn = NULL;
     guest_region_t *regions_snapshot = NULL;
-    guest_region_t preannounced_snapshot[GUEST_MAX_PREANNOUNCED];
     int snapshot_shm_fd = -1;
     bool siblings_quiesced = false;
+    bool mmap_locked = false;
     int64_t fail_rc = -LINUX_ENOMEM;
 
     /* Quiesce sibling vCPUs for snapshot consistency. In multithreaded guests,
@@ -1764,8 +1765,25 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      * kernel page cache and reach the other. File-backed MAP_SHARED regions
      * already carry a backing fd and are unaffected. Misaligned shared regions
      * (snapshot-style) remain incoherent across fork by design.
+     *
+     * mmap_lock is held from here until the process-state send has passed the
+     * region backing fds over SCM_RIGHTS. The quiesce above gives up after its
+     * timeout, and a sibling already queued on mmap_lock never reaches the
+     * barrier, so without the lock its munmap could rewrite the region table
+     * during the overlay sync, the clone snapshot, the header, or the region
+     * copy, or close a backing fd before it is sent. Everything taken beneath
+     * it (fd_lock, pty_keepalive_lock, elf_path_lock, sysroot_lock, sig_lock)
+     * follows mmap_lock in the order in syscall/internal.h. The IPC writes
+     * under it cannot deadlock: the child only reads until admission and needs
+     * nothing from this process to keep reading, and a child that dies turns
+     * the next write into EPIPE (SO_NOSIGPIPE above). The cost lands on that
+     * same straggler: it now waits in pthread_mutex_lock for the whole send,
+     * the region copy included on the non-shm path, where no teardown wake
+     * reaches it, so an exit_group join during a slow fork can time out on it.
      */
-    if (mmap_fork_prepare_anon_shared(g, &anon_shared_txn) < 0)
+    mmap_lock_acquire();
+    mmap_locked = true;
+    if (mmap_fork_prepare_anon_shared_locked(g, &anon_shared_txn) < 0)
         goto fail_snapshot;
 
     /* CoW fast path: if shm_fd >= 0, send a snapshot of guest memory to the
@@ -1943,7 +1961,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         log_error("clone: failed to send registers");
         goto fail_snapshot;
     }
-    if (fork_ipc_send_memory_regions(ipc_sock, g, use_shm) < 0) {
+    if (fork_ipc_send_memory_regions_locked(ipc_sock, g, use_shm) < 0) {
         log_error("clone: failed to send memory regions");
         goto fail_snapshot;
     }
@@ -1964,11 +1982,6 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         }
         memcpy(regions_snapshot, g->regions, snap_sz);
     }
-    int npreannounced_snapshot = g->npreannounced;
-    if (npreannounced_snapshot > 0) {
-        memcpy(preannounced_snapshot, g->preannounced,
-               (size_t) npreannounced_snapshot * sizeof(guest_region_t));
-    }
 
     if (fork_ipc_send_fd_table(ipc_sock) < 0) {
         log_error("clone: failed to send fd table");
@@ -1985,14 +1998,14 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     }
 
     uint32_t num_guest_regions = (uint32_t) nregions_snapshot;
-    uint32_t num_preannounced = (uint32_t) npreannounced_snapshot;
-    if (fork_ipc_send_process_state(
-            ipc_sock, regions_snapshot, num_guest_regions,
-            regions_tracker_stale_snapshot, preannounced_snapshot,
-            num_preannounced) < 0) {
+    if (fork_ipc_send_process_state(ipc_sock, regions_snapshot,
+                                    num_guest_regions,
+                                    regions_tracker_stale_snapshot) < 0) {
         log_error("clone: failed to send process state");
         goto fail_snapshot;
     }
+    mmap_lock_release();
+    mmap_locked = false;
 
     if (chown_overlay_send(ipc_sock) < 0) {
         log_error("clone: failed to send chown overlay");
@@ -2075,6 +2088,9 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     return child_guest_pid;
 
 fail_snapshot:
+    /* mmap_fork_abort_anon_shared takes mmap_lock itself. */
+    if (mmap_locked)
+        mmap_lock_release();
     proc_cancel_child(child_guest_pid);
     free(regions_snapshot);
     if (snapshot_shm_fd >= 0)

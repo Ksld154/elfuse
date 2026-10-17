@@ -64,6 +64,7 @@
     _(ENOSYS,          LINUX_ENOSYS)          /* mac 78 -> linux 38 */   \
     _(EOVERFLOW,       LINUX_EOVERFLOW)       /* mac 84 -> linux 75 */   \
     _(EILSEQ,          LINUX_EILSEQ)          /* mac 92 -> linux 84 */   \
+    _(EIDRM,           LINUX_EIDRM)           /* mac 90 -> linux 43 */   \
     _(ENOMSG,          LINUX_ENOMSG)          /* mac 91 -> linux 42 */   \
     _(EMULTIHOP,       LINUX_EMULTIHOP)       /* mac 95 -> linux 72 */   \
     _(ENOLINK,         LINUX_ENOLINK)         /* mac 97 -> linux 67 */   \

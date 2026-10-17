@@ -56,6 +56,9 @@ int fork_ipc_read_all(int fd, void *buf, size_t len)
 #define FORK_IPC_SEND_STALL_LIMIT 8
 #define FORK_IPC_SEND_BACKOFF_US 1000
 
+/* Records a peer may still send in the retired preannounced-region slot. */
+#define FORK_IPC_RETIRED_PREANNOUNCED_MAX 16
+
 int fork_ipc_send_fds(int sock, const int *fds, int count)
 {
     if (count <= 0)
@@ -191,7 +194,9 @@ int fork_ipc_recv_fds(int sock, int *fds, int max_count, int *out_count)
     return 0;
 }
 
-int fork_ipc_send_memory_regions(int ipc_sock, const guest_t *g, bool use_shm)
+int fork_ipc_send_memory_regions_locked(int ipc_sock,
+                                        const guest_t *g,
+                                        bool use_shm)
 {
     if (use_shm) {
         uint32_t zero_regions = 0;
@@ -202,9 +207,7 @@ int fork_ipc_send_memory_regions(int ipc_sock, const guest_t *g, bool use_shm)
 #define MAX_USED_REGIONS 16
     used_region_t used[MAX_USED_REGIONS];
     unsigned int shim_sz = proc_get_shim_size();
-    mmap_lock_acquire();
     int nregions = guest_get_used_regions(g, shim_sz, used, MAX_USED_REGIONS);
-    mmap_lock_release();
 
     uint32_t num_regions = (uint32_t) nregions;
     if (fork_ipc_write_all(ipc_sock, &num_regions, sizeof(num_regions)) < 0)
@@ -296,10 +299,11 @@ int fork_ipc_send_fd_table(int ipc_sock)
          * syscall/internal.h for the rationale (kqueue cannot cross SCM_RIGHTS
          * on macOS, per-class side tables are not serialized). The child sees
          * these slots as FD_CLOSED and recreates them via the appropriate
-         * syscall.
+         * syscall. A pidfd is the exception: its side table is one target pid,
+         * which rides in the entry, and Linux hands it to the child.
          */
         int t = fd_table[i].type;
-        if (fd_type_is_synthetic(t))
+        if (fd_type_is_synthetic(t) && t != FD_PIDFD)
             continue;
 
         /* Pin rather than dup. SCM_RIGHTS does not consume the sender's
@@ -332,6 +336,10 @@ int fork_ipc_send_fd_table(int ipc_sock)
         fd_entries[num_fds].fasync_owner = fd_table[i].fasync_owner;
         memcpy(fd_entries[num_fds].proc_path, fd_table[i].proc_path,
                sizeof(fd_entries[num_fds].proc_path));
+        fd_entries[num_fds].pidfd = (pidfd_fork_state_t) {.target_pid = -1};
+        if (t == FD_PIDFD)
+            pidfd_fork_snapshot_locked(fd_table[i].ofd_id,
+                                       &fd_entries[num_fds].pidfd);
         host_fds_to_send[num_fds] = host_fd;
         host_fd_pins[num_fds] = pin;
         num_fds++;
@@ -371,6 +379,28 @@ fail:
     return -1;
 }
 
+/* Rebuild one inherited pidfd slot. The first slot of a description gets its
+ * own pipe, registry entry and monitor; a later alias (child_ofd already
+ * assigned) dups that slot's pipe, src_host, so both stay names for one entry.
+ */
+static int fork_rebuild_pidfd(int gfd,
+                              uint64_t child_ofd,
+                              int src_host,
+                              const ipc_fd_entry_t *e)
+{
+    if (!child_ofd)
+        return pidfd_fork_restore(gfd, &e->pidfd);
+    int h = fcntl(src_host, F_DUPFD_CLOEXEC, 0);
+    if (h < 0)
+        return -1;
+    fd_alias_spec_t spec = fd_alias_identity(child_ofd, e->linux_flags);
+    int rc = fd_alloc_alias_at(&spec, gfd, FD_PIDFD, h,
+                               fd_cleanup_for_type(FD_PIDFD), NULL);
+    if (rc < 0)
+        close(h);
+    return rc;
+}
+
 int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
 {
     (void) g;
@@ -407,7 +437,9 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
     bool low_fd_present[3] = {false, false, false};
     for (uint32_t i = 0; i < num_fds; i++) {
         int gfd = fd_entries[i].guest_fd;
-        if (RANGE_CHECK(gfd, 0, 3) && !fd_type_is_synthetic(fd_entries[i].type))
+        int t = fd_entries[i].type;
+        if (RANGE_CHECK(gfd, 0, 3) &&
+            (!fd_type_is_synthetic(t) || t == FD_PIDFD))
             low_fd_present[gfd] = true;
     }
     for (int fd = 0; fd < 3; fd++)
@@ -483,6 +515,28 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
             fd_table[gfd].path_poll_capable =
                 fd_entries[i].path_poll_capable != 0;
             fd_table[gfd].seals = fd_entries[i].seals;
+        } else if (fd_entries[i].type == FD_PIDFD) {
+            /* The descriptor that arrived is the parent's pipe, whose write end
+             * the parent's monitor completes and whose last parent close would
+             * read as the target exiting. The child builds its own instead,
+             * once per description: a later alias dups the first slot's pipe,
+             * so both stay names for one registry entry.
+             */
+            close(host_fds[i]);
+            if (fork_rebuild_pidfd(gfd, child_ofd, shared_dir_host,
+                                   &fd_entries[i]) < 0) {
+                /* Fatal, not a dropped slot: a fork that succeeds with an
+                 * inherited pidfd missing hands the child EBADF on a descriptor
+                 * Linux would have given it.
+                 */
+                log_error("fork-child: could not rebuild pidfd %d", gfd);
+                for (uint32_t j = i + 1; j < num_fds; j++)
+                    close(host_fds[j]);
+                free(host_fds);
+                free(fd_entries);
+                return -1;
+            }
+            fd_table[gfd].linux_flags = fd_entries[i].linux_flags;
         } else if (fd_type_is_synthetic(fd_entries[i].type)) {
             /* Defense in depth: the parent's fork_ipc_send_fd_table already
              * filters synthetic types out of the SCM_RIGHTS payload (see
@@ -801,9 +855,7 @@ static int fork_ipc_send_backing_fds(int ipc_sock,
 int fork_ipc_send_process_state(int ipc_sock,
                                 const guest_region_t *regions_snapshot,
                                 uint32_t num_guest_regions,
-                                bool regions_tracker_stale_snapshot,
-                                const guest_region_t *preannounced_snapshot,
-                                uint32_t num_preannounced)
+                                bool regions_tracker_stale_snapshot)
 {
     char cwd[LINUX_PATH_MAX] = {0};
     getcwd(cwd, sizeof(cwd));
@@ -855,12 +907,13 @@ int fork_ipc_send_process_state(int ipc_sock,
                            num_guest_regions * sizeof(guest_region_t)) < 0)
         return -1;
 
-    if (fork_ipc_write_all(ipc_sock, &num_preannounced,
-                           sizeof(num_preannounced)) < 0)
-        return -1;
-    if (num_preannounced > 0 &&
-        fork_ipc_write_all(ipc_sock, preannounced_snapshot,
-                           num_preannounced * sizeof(guest_region_t)) < 0)
+    /* The retired preannounced-region count, always zero. The child may be a
+     * different elfuse binary than this one, so the slot stays until the next
+     * FORK_IPC_PROTOCOL_MAGIC bump rather than shifting the payload under a
+     * peer that still speaks this protocol.
+     */
+    uint32_t retired_count = 0;
+    if (fork_ipc_write_all(ipc_sock, &retired_count, sizeof(retired_count)) < 0)
         return -1;
 
     if (fork_ipc_send_backing_fds(ipc_sock, regions_snapshot,
@@ -1055,9 +1108,9 @@ int fork_ipc_recv_process_state(int ipc_fd,
     }
 
     /* Drain any excess records the parent serialized beyond the local cap.
-     * Without this drain, the next read (num_preannounced) consumes stale
-     * region bytes and desynchronizes the rest of the IPC payload. Mirrors the
-     * preannounced-region drain below.
+     * Without this drain, the next read (the retired preannounced count)
+     * consumes stale region bytes and desynchronizes the rest of the IPC
+     * payload.
      */
     if (num_guest_regions > recv_regions &&
         fork_ipc_drain_bytes(ipc_fd, (num_guest_regions - recv_regions) *
@@ -1077,26 +1130,18 @@ int fork_ipc_recv_process_state(int ipc_fd,
     g->regions_tracker_stale =
         (regions_tracker_stale != 0) || (num_guest_regions > recv_regions);
 
-    uint32_t num_preannounced = 0;
-    if (fork_ipc_read_all(ipc_fd, &num_preannounced, sizeof(num_preannounced)) <
-        0) {
-        log_error("fork-child: failed to read preannounced count");
+    /* The retired preannounced-region slot. Nothing produces those regions, so
+     * the records a peer sends are discarded rather than restored. The bound is
+     * the old table size, which is all a peer speaking this protocol can send.
+     */
+    uint32_t retired_count = 0;
+    if (fork_ipc_read_all(ipc_fd, &retired_count, sizeof(retired_count)) < 0 ||
+        retired_count > FORK_IPC_RETIRED_PREANNOUNCED_MAX ||
+        fork_ipc_drain_bytes(
+            ipc_fd, (uint32_t) (retired_count * sizeof(guest_region_t))) < 0) {
+        log_error("fork-child: bad retired preannounced slot");
         return -1;
     }
-    uint32_t recv_preannounced = num_preannounced;
-    if (recv_preannounced > GUEST_MAX_PREANNOUNCED)
-        recv_preannounced = GUEST_MAX_PREANNOUNCED;
-    if (recv_preannounced > 0 &&
-        fork_ipc_read_all(ipc_fd, g->preannounced,
-                          recv_preannounced * sizeof(guest_region_t)) < 0) {
-        log_error("fork-child: failed to read preannounced regions");
-        return -1;
-    }
-    if (num_preannounced > recv_preannounced &&
-        fork_ipc_drain_bytes(ipc_fd, (num_preannounced - recv_preannounced) *
-                                         sizeof(guest_region_t)) < 0)
-        return -1;
-    g->npreannounced = (int) recv_preannounced;
 
     /* Capture parent state before clearing the inherited overlay/backing fd
      * fields. parent_had_fd lets recv_backing_fds iterate in the same order the

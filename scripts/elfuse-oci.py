@@ -175,7 +175,7 @@ def is_guest_exec(rootfs, guest_path):
     """Return whether guest_path is a file in rootfs a root guest may execute.
 
     Any execute bit is enough, as in elfuse's execve check for root
-    (check_exec_permission in src/syscall/exec.c).
+    (exec_check_permission in src/syscall/exec.c).
     """
     host = resolve_in_root(rootfs, guest_path)
     return os.path.isfile(host) and bool(os.stat(host).st_mode & 0o111)

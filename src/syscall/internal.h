@@ -188,13 +188,20 @@
 #include "linux-limits.h"
 #include "runtime/thread.h"
 
+/* Whether the guest's effective IDs may execute a file with this stat: 0, or a
+ * negative Linux errno. The caller applies the chown overlay first when the
+ * stat came from the host (src/syscall/exec.c).
+ */
+struct stat;
+int exec_check_permission(const struct stat *st);
+
 typedef int guest_fd_t;
 typedef int host_fd_t;
 
 /* Cross-module locks. */
-extern pthread_mutex_t fd_lock; /* Lock order: 3, FD table */
+extern pthread_mutex_t fd_lock; /* FD table */
 
-/* mmap_lock (Lock order: 1, mmap/brk + page tables) is not recursive. */
+/* mmap_lock (mmap/brk + page tables) is not recursive. */
 void mmap_lock_acquire(void);
 void mmap_lock_release(void);
 
@@ -362,6 +369,12 @@ int fd_alloc_alias(const fd_alias_spec_t *spec,
                    int type,
                    int host_fd,
                    void (*cleanup)(int));
+
+/* An ofd_id no slot carries yet, for a creator whose side table is keyed by
+ * description and has to be bound before a sibling can dup or close the slot
+ * (the pidfd registry). The slot is then allocated with fd_alias_identity.
+ */
+uint64_t fd_reserve_ofd_id(void);
 int fd_alloc_alias_at(const fd_alias_spec_t *spec,
                       int fd,
                       int type,
@@ -640,7 +653,8 @@ void (*fd_cleanup_for_type(int type))(int);
  * per-class side-table state (eventfd counter, signalfd mask, pidfd target,
  * epoll set, ...) is not serialized. The child must recreate such fds via the
  * appropriate syscall, so the parent filters them from the SCM_RIGHTS payload
- * and the receiver drops any that still arrive.
+ * and the receiver drops any that still arrive. FD_PIDFD is the exception: its
+ * target rides in the fd entry and pidfd_fork_restore rebuilds it.
  */
 static inline bool fd_type_is_synthetic(int type)
 {

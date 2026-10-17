@@ -34,9 +34,11 @@
 #include "syscall/poll.h"
 
 /* Protects the FD table (fd_alloc, fd_alloc_at, fd_alloc_from, sys_close). File
- * descriptor operations from concurrent threads must be serialized.
+ * descriptor operations from concurrent threads must be serialized. Its place
+ * in the acquisition order is the lock-ordering block in
+ * src/syscall/internal.h.
  */
-pthread_mutex_t fd_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 3 */
+pthread_mutex_t fd_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* FD table. */
 fd_entry_t fd_table[FD_TABLE_SIZE];
@@ -661,6 +663,14 @@ int fd_alloc_from(int minfd,
         *out_gen = fd_table[fd].generation;
     pthread_mutex_unlock(&fd_lock);
     return fd;
+}
+
+uint64_t fd_reserve_ofd_id(void)
+{
+    pthread_mutex_lock(&fd_lock);
+    uint64_t id = fd_next_ofd_id++;
+    pthread_mutex_unlock(&fd_lock);
+    return id;
 }
 
 /* The alias-aware entry points. Each is the plain allocator with the

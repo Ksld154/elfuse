@@ -19,11 +19,41 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <signal.h>
 #include <sys/un.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "linux-openat2.h"
 #include "raw-syscall.h"
+
+static inline void sleep_ms(long ms)
+{
+    struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
+    nanosleep(&ts, NULL);
+}
+
+/* Reap a child with a deadline, so a waiter stuck in the kernel fails the test
+ * instead of hanging the lane; a child still running at the deadline is killed.
+ *
+ * Returns the exit status, or -1 on a timeout or a non-exit.
+ */
+static inline int reap_within(pid_t pid, long ms)
+{
+    int st;
+    for (long waited = 0; waited < ms; waited += 20) {
+        pid_t r = waitpid(pid, &st, WNOHANG);
+        if (r == pid)
+            return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+        if (r < 0)
+            return -1;
+        sleep_ms(20);
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, &st, 0);
+    return -1;
+}
 
 static inline ssize_t read_fd_all_nul(int fd, char *buf, size_t bufsz)
 {

@@ -45,54 +45,52 @@ static bool host_socket_is_unix(int host_fd)
            ss.ss_family == AF_UNIX;
 }
 
+/* Replace each guest fd in an outbound SCM_RIGHTS payload with a host dup the
+ * caller owns, made under fd_lock.
+ *
+ * A dup rather than the slot's raw host fd because the send happens later,
+ * outside the lock: a sibling closing the guest fd in between would free the
+ * host number for elfuse's own next descriptor, and the peer would be handed
+ * that instead. The dup names the same open file description the guest named,
+ * so the peer cannot tell the difference. Every entry gets its own dup, even a
+ * repeated guest fd, so close_scm_rights_dups can close each one exactly once.
+ *
+ * On failure every dup made so far is closed and fds is left unusable.
+ */
 static int translate_scm_rights_fds(int *fds, size_t nfds)
 {
     if (nfds > LINUX_SCM_MAX_FD)
         return -LINUX_EINVAL;
 
-    int stack_host_fds[16];
-    int *host_fds = stack_host_fds;
-    int *heap_host_fds = NULL;
-    int seen_guest_fds[128], seen_host_fds[128];
-    size_t seen_count = 0;
-
-    if (nfds > ARRAY_SIZE(stack_host_fds)) {
-        heap_host_fds = malloc(nfds * sizeof(*heap_host_fds));
-        if (!heap_host_fds)
-            return -LINUX_ENOMEM;
-        host_fds = heap_host_fds;
-    }
-
     for (size_t i = 0; i < nfds; i++) {
-        int guest_fd = fds[i], host_fd = -1;
-
-        for (size_t j = 0; j < seen_count; j++) {
-            if (seen_guest_fds[j] == guest_fd) {
-                host_fd = seen_host_fds[j];
-                break;
-            }
-        }
-
+        errno = EBADF;
+        int host_fd = fd_to_host_dup(fds[i]);
         if (host_fd < 0) {
-            host_fd = fd_to_host(guest_fd);
-            if (seen_count < ARRAY_SIZE(seen_guest_fds)) {
-                seen_guest_fds[seen_count] = guest_fd;
-                seen_host_fds[seen_count] = host_fd;
-                seen_count++;
-            }
+            int err = errno == EBADF ? -LINUX_EBADF : -LINUX_ENOMEM;
+            for (size_t j = 0; j < i; j++)
+                close(fds[j]);
+            return err;
         }
-        if (host_fd < 0) {
-            free(heap_host_fds);
-            return -LINUX_EBADF;
-        }
-        host_fds[i] = host_fd;
+        fds[i] = host_fd;
     }
-
-    for (size_t i = 0; i < nfds; i++)
-        fds[i] = host_fds[i];
-
-    free(heap_host_fds);
     return 0;
+}
+
+/* Close the host dups translate_scm_rights_fds installed in the first len bytes
+ * of a translated control buffer. Runs after the send on every path, since the
+ * kernel took its own references when the message was queued.
+ */
+static void close_scm_rights_dups(uint8_t *ctrl, size_t len)
+{
+    struct msghdr m = {.msg_control = ctrl, .msg_controllen = (socklen_t) len};
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c)) {
+        if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS)
+            continue;
+        size_t n = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+        int *fds = (int *) CMSG_DATA(c);
+        for (size_t i = 0; i < n; i++)
+            close(fds[i]);
+    }
 }
 
 static void recvmsg_cleanup_scm_rights(const int *scm_gfds,
@@ -142,15 +140,102 @@ static void build_scm_cred_cmsg(uint8_t *dst)
     memcpy(dst + CMSG_LINUX_HDR_BYTES, &cred, sizeof(cred));
 }
 
+/* Advance an iovec past bytes already moved, so the next round starts after
+ * them.
+ *
+ * Returns the number of leading entries fully consumed.
+ */
+static int msg_iov_advance(struct iovec *iov, int iovcnt, size_t moved)
+{
+    size_t rem = 0;
+    int spent = iov_advance_index(iov, iovcnt, moved, &rem);
+    if (spent < iovcnt && rem > 0) {
+        iov[spent].iov_base = (char *) iov[spent].iov_base + rem;
+        iov[spent].iov_len -= rem;
+    }
+    return spent;
+}
+
+int64_t net_send_xfer(const fd_block_state_t *st,
+                      int host_fd,
+                      struct msghdr *msg,
+                      int linux_flags)
+{
+    uint64_t want = 0;
+    for (int i = 0; i < (int) msg->msg_iovlen; i++) {
+        if (!iov_total_add(want, msg->msg_iov[i].iov_len, &want))
+            return -LINUX_EINVAL;
+    }
+
+    bool blocking = want > 0 && sock_op_should_block(st, host_fd, linux_flags);
+    int host_flags =
+        translate_msg_flags(linux_flags) | (blocking ? MSG_DONTWAIT : 0);
+    uint64_t total = 0;
+    int spins = 0;
+    unsigned backoff = 0;
+    for (;;) {
+        if (blocking) {
+            int64_t waited = io_wait_fd_or_interrupted(host_fd, POLLOUT);
+            if (waited < 0)
+                return total > 0 ? (int64_t) total : waited;
+        }
+        ssize_t ret = sendmsg(host_fd, msg, host_flags);
+        if (ret < 0) {
+            if (!blocking || errno != EAGAIN)
+                break;
+
+            /* The wait reports ready on POLLHUP and POLLERR too, so a send that
+             * keeps answering EAGAIN would spin a core; back off as io_xfer
+             * does, which also puts an interrupt check in the loop.
+             */
+            if (++spins >= IO_XFER_SPIN_LIMIT) {
+                int64_t rc = io_retry_backoff(&backoff);
+                if (rc < 0)
+                    return total > 0 ? (int64_t) total : rc;
+            }
+            continue;
+        }
+        spins = 0;
+        backoff = 0;
+        total += (uint64_t) ret;
+
+        /* Only a stream send owes the rest. A datagram or seqpacket send is one
+         * record and either went whole or failed, and asking the type only
+         * after a short send keeps getsockopt off every send that completes.
+         */
+        if (!blocking || ret == 0 || total == want ||
+            !host_socket_is_stream(host_fd))
+            return (int64_t) total;
+
+        int spent =
+            msg_iov_advance(msg->msg_iov, (int) msg->msg_iovlen, (size_t) ret);
+        msg->msg_iov += spent;
+        msg->msg_iovlen -= spent;
+
+        /* The first round queued the rights and the address with its bytes;
+         * Linux attaches ancillary data to the first segment only, and a second
+         * copy would install the descriptors twice at the peer.
+         */
+        msg->msg_control = NULL;
+        msg->msg_controllen = 0;
+        msg->msg_name = NULL;
+        msg->msg_namelen = 0;
+    }
+
+    /* A stream send that moved bytes reports them and raises no SIGPIPE: both
+     * unix_stream_sendmsg and tcp_sendmsg signal only when nothing was sent.
+     */
+    if (total > 0)
+        return (int64_t) total;
+    if (errno == EPIPE && !(linux_flags & LINUX_MSG_NOSIGNAL))
+        signal_queue(LINUX_SIGPIPE);
+    return linux_errno();
+}
+
 /* Send the no-name, no-control, single-iovec fast path of a msghdr.
  *
  * Returns the byte count or a negative Linux errno, and consumes host_ref
- * either way.
- *
- * The blocking contract is elfuse's own: wait for POLLOUT first, then a send
- * that reports EAGAIN instead of parking the vCPU, retried when a sibling took
- * the space first. macOS does not honor MSG_DONTWAIT on AF_UNIX, which is why
- * the wait comes before the send rather than the send driving it.
+ * either way. net_send_xfer carries the blocking contract.
  */
 static int64_t net_send_single_iov(guest_t *g,
                                    const linux_msghdr_t *lmsg,
@@ -182,29 +267,10 @@ static int64_t net_send_single_iov(guest_t *g,
             len = (size_t) avail;
     }
 
-    bool blocking =
-        len > 0 && sock_op_should_block(sock_st, host_ref->fd, linux_flags);
-    int host_flags =
-        translate_msg_flags(linux_flags) | (blocking ? MSG_DONTWAIT : 0);
-    ssize_t ret;
-    for (;;) {
-        if (blocking) {
-            int64_t waited = io_wait_fd_or_interrupted(host_ref->fd, POLLOUT);
-            if (waited < 0) {
-                host_fd_ref_close(host_ref);
-                return waited;
-            }
-        }
-        ret = send(host_ref->fd, base, len, host_flags);
-        if (!(blocking && ret < 0 && errno == EAGAIN))
-            break;
-    }
+    struct iovec iov = {.iov_base = base, .iov_len = len};
+    struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1};
+    int64_t ret = net_send_xfer(sock_st, host_ref->fd, &msg, linux_flags);
     host_fd_ref_close(host_ref);
-    if (ret < 0) {
-        if (errno == EPIPE && !(linux_flags & LINUX_MSG_NOSIGNAL))
-            signal_queue(LINUX_SIGPIPE);
-        return linux_errno();
-    }
     return ret;
 }
 
@@ -228,9 +294,6 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
     if ((!lmsg.msg_name || lmsg.msg_namelen == 0) &&
         (!lmsg.msg_control || lmsg.msg_controllen == 0) && lmsg.msg_iovlen == 1)
         return net_send_single_iov(g, &lmsg, &host_ref, &sock_st, linux_flags);
-
-    int mac_flags = translate_msg_flags(linux_flags);
-    bool suppress_sigpipe = (linux_flags & LINUX_MSG_NOSIGNAL) != 0;
 
     struct sockaddr_storage mac_sa;
     struct sockaddr *dest_sa = NULL;
@@ -370,6 +433,7 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
                 size_t nfds = ldata_len / sizeof(int);
                 int rc = translate_scm_rights_fds(fds, nfds);
                 if (rc < 0) {
+                    close_scm_rights_dups(mac_ctrl, mpos);
                     free(linux_ctrl_heap);
                     free(mac_ctrl_heap);
                     host_iov_free(&host_iov);
@@ -398,34 +462,12 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
         .msg_flags = 0,
     };
 
-    bool blocking = host_iov_has_payload(&host_iov, send_iovcnt) &&
-                    sock_op_should_block(&sock_st, host_ref.fd, linux_flags);
-    int host_flags = mac_flags | (blocking ? MSG_DONTWAIT : 0);
-    ssize_t ret;
-    for (;;) {
-        if (blocking) {
-            int64_t waited = io_wait_fd_or_interrupted(host_ref.fd, POLLOUT);
-            if (waited < 0) {
-                free(linux_ctrl_heap);
-                free(mac_ctrl_heap);
-                host_iov_free(&host_iov);
-                host_fd_ref_close(&host_ref);
-                return waited;
-            }
-        }
-        ret = sendmsg(host_ref.fd, &msg, host_flags);
-        if (!(blocking && ret < 0 && errno == EAGAIN))
-            break;
-    }
+    int64_t ret = net_send_xfer(&sock_st, host_ref.fd, &msg, linux_flags);
+    close_scm_rights_dups(mac_ctrl, (size_t) ctrl_len);
     free(linux_ctrl_heap);
     free(mac_ctrl_heap);
     host_iov_free(&host_iov);
     host_fd_ref_close(&host_ref);
-    if (ret < 0) {
-        if (errno == EPIPE && !suppress_sigpipe)
-            signal_queue(LINUX_SIGPIPE);
-        return linux_errno();
-    }
     return ret;
 }
 
@@ -450,22 +492,6 @@ static bool msg_gathers_waitall(int host_fd, int linux_flags, size_t controllen)
     if (controllen != 0)
         return false;
     return recv_gathers_waitall(host_fd, linux_flags);
-}
-
-/* Advance an iovec past bytes already received, so the next round writes after
- * them.
- *
- * Returns the number of leading entries fully consumed.
- */
-static int msg_iov_advance(struct iovec *iov, int iovcnt, size_t moved)
-{
-    size_t rem = 0;
-    int spent = iov_advance_index(iov, iovcnt, moved, &rem);
-    if (spent < iovcnt && rem > 0) {
-        iov[spent].iov_base = (char *) iov[spent].iov_base + rem;
-        iov[spent].iov_len -= rem;
-    }
-    return spent;
 }
 
 /* Total bytes an iovec can still accept. */

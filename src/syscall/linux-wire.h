@@ -107,6 +107,7 @@ typedef struct {
 #define LINUX_EOWNERDEAD 130
 /* Additional errno values needed for complete macOS->Linux mapping */
 #define LINUX_ENOMSG 42     /* No message of desired type */
+#define LINUX_EIDRM 43      /* Identifier removed */
 #define LINUX_ENOLINK 67    /* Link has been severed */
 #define LINUX_EPROTO 71     /* Protocol error */
 #define LINUX_EMULTIHOP 72  /* Multihop attempted */

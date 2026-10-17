@@ -36,6 +36,7 @@
 #include "proved/slice.h"
 
 #include "core/rosetta.h"
+#include "core/host-sigbus.h"
 #include "core/shim-globals.h"
 #include "hvutil.h"
 #include "runtime/futex.h" /* futex_interrupt_consume, in the tty drain */
@@ -414,13 +415,15 @@ static bool io_eagain_should_wait(const fd_block_state_t *st, int host_fd)
 /* One transfer attempt, in the form that reports EAGAIN rather than parking the
  * caller.
  *
- * Sockets take a per-call MSG_DONTWAIT, which leaves the open file description
- * alone. Everything else relies on elfuse owning O_NONBLOCK on the host fd
- * (fd_init_entry); macOS has no per-call equivalent for a pipe and no private
- * open file description to borrow either, since dup shares the status flags
- * (measured) and a pipe has no path to reopen. On a description elfuse does not
- * own (io.h names which) this blocks, and the loop above goes round again only
- * if a host signal truncated the transfer.
+ * What makes it nonblocking is elfuse owning O_NONBLOCK on the host fd
+ * (fd_init_entry), sockets included. The MSG_DONTWAIT a socket also gets is not
+ * what the guarantee rests on: macOS ignores it on AF_UNIX, where a send to a
+ * full stream socket writes what fits and then blocks for the rest. Ownership
+ * is needed for a pipe in any case, since macOS has no per-call flag for one
+ * and no private open file description to borrow either: dup shares the status
+ * flags (measured) and a pipe has no path to reopen. On a description elfuse
+ * does not own (io.h names which) this blocks, and the loop above goes round
+ * again only if a host signal truncated the transfer.
  */
 static ssize_t io_xfer_once(int host_fd,
                             bool is_socket,
@@ -1466,48 +1469,55 @@ static int64_t proc_try_writev_intercept(int fd,
                                          int64_t offset,
                                          int use_pwrite)
 {
-    uint64_t total = 0;
-    char stack_buf[256];
-    char *buf = stack_buf;
-    char *heap = NULL;
-    ssize_t written = 0;
-    int handled;
-
-    /* The sum feeds malloc() and then a memcpy loop that writes exactly that
-     * many bytes, so a wrapped total here is a short allocation followed by a
-     * long copy. host_iov_prepare clamps every entry to the guest mapping it
-     * points into, which made the wrap unreachable by provenance rather than by
-     * construction; iov_total_add makes it unreachable by construction.
+    /* Classify before gathering. Every intercepted node is stamped with its
+     * virtual path at open, so a slot without one is not a /proc node and its
+     * payload is none of this helper's business; gathering first cost a regular
+     * writev a copy of everything it wrote.
      */
+    fd_entry_t snap;
+    if (!fd_snapshot(fd, &snap) || snap.proc_path[0] == '\0')
+        return INT64_MIN;
+
+    /* INT64_MIN is this helper's "not handled", and that is the right answer
+     * for a sum Linux refuses: the size verdict belongs to the real writev
+     * below, not to the interceptor.
+     */
+    uint64_t total = 0;
     for (int i = 0; i < iovcnt; i++) {
-        /* INT64_MIN is this helper's "not handled", and that is the right
-         * answer: the fd may well not be a /proc node, so the size verdict
-         * belongs to the real writev below, not to the interceptor.
-         */
         if (!iov_total_add(total, iov[i].iov_len, &total))
             return INT64_MIN;
     }
-    if (total > sizeof(stack_buf)) {
-        heap = malloc(total);
-        if (!heap)
-            return -LINUX_ENOMEM;
-        buf = heap;
-    }
 
-    size_t off = 0;
+    /* One write per entry, as Linux does: the /proc nodes have a plain write op
+     * and no write_iter, so vfs_writev takes do_loop_readv_writev, which writes
+     * each segment on its own and stops at the first short or failed one. Each
+     * entry hands over a bounded prefix, never the whole segment: the guest
+     * picks its length, and 1024 entries naming one 1 GiB mapping used to ask
+     * the host for a 1 TiB gather. The writers parse one short decimal number,
+     * and proc_intercept_write consumes at most the prefix Linux's
+     * oom_score_adj_write reads and reports that many, so a longer segment is a
+     * short write, which ends the loop the way the short write ends Linux's.
+     */
+    int64_t done = 0;
     for (int i = 0; i < iovcnt; i++) {
-        memcpy(buf + off, iov[i].iov_base, iov[i].iov_len);
-        off += iov[i].iov_len;
-    }
+        char buf[256];
+        size_t n = iov[i].iov_len;
+        if (n > sizeof(buf))
+            n = sizeof(buf);
+        memcpy(buf, iov[i].iov_base, n);
 
-    handled = proc_intercept_write(fd, host_fd, buf, total, offset, use_pwrite,
-                                   &written);
-    free(heap);
-    if (handled < 0)
-        return linux_errno();
-    if (handled > 0)
-        return written;
-    return INT64_MIN;
+        ssize_t written = 0;
+        int handled = proc_intercept_write(fd, host_fd, buf, n, offset + done,
+                                           use_pwrite, &written);
+        if (handled < 0)
+            return done > 0 ? done : linux_errno();
+        if (handled == 0)
+            return i == 0 ? INT64_MIN : done;
+        done += written;
+        if ((size_t) written != iov[i].iov_len)
+            break;
+    }
+    return done;
 }
 
 static int64_t io_write_result(ssize_t ret)
@@ -1935,44 +1945,50 @@ static int64_t single_guest_iov(guest_t *g,
  * check: Linux never reaches the write path for an empty vector, so a
  * write-sealed memfd returns 0 here too.
  */
+static bool vec_host_mode_mirrors_guest(int type)
+{
+    return type == FD_REGULAR || type == FD_DIR || type == FD_PIPE ||
+           type == FD_SOCKET || type == FD_STDIO || type == FD_URANDOM;
+}
+
 static int64_t vec_zero_iovcnt(int fd, bool op_is_write, bool positional)
 {
+    /* Pin and read the entry in one lookup, so the type the probes below trust
+     * and the descriptor they probe belong to the same file; two lookups let a
+     * sibling's close and reopen pair one file's type with another's
+     * descriptor. A slot with no host descriptor (a FUSE file) cannot be pinned
+     * and has nothing to probe, so it is classified from a plain snapshot
+     * instead.
+     */
+    host_fd_ref_t host_ref;
     fd_entry_t snap;
-    if (!fd_snapshot(fd, &snap) || snap.type == FD_PATH)
+    int64_t ref_err = host_fd_ref_open_entry(fd, &host_ref, &snap);
+    if (ref_err < 0 && !fd_snapshot(fd, &snap))
         return -LINUX_EBADF;
 
-    /* usbdevfs is the one type whose host fd says nothing useful and whose
-     * guest-visible mode is nonetheless known: the fd sits on a readiness pipe,
-     * and the open mode lives in the slot's linux_flags. It is seekable, so
-     * only the direction test applies, and it is answered by the same rule the
-     * non-empty calls use rather than by a second opinion.
-     */
-    if (snap.type == FD_USBDEV) {
-        if (op_is_write)
-            return usbdev_write_refused(fd);
-        return usbdev_read_refused(fd);
-    }
-
-    bool host_mode_mirrors_guest =
-        snap.type == FD_REGULAR || snap.type == FD_DIR ||
-        snap.type == FD_PIPE || snap.type == FD_SOCKET ||
-        snap.type == FD_STDIO || snap.type == FD_URANDOM;
-    if (!host_mode_mirrors_guest)
-        return 0;
-
-    host_fd_ref_t host_ref;
-    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
-    if (ref_err < 0)
-        return ref_err;
-
     int64_t ret = 0;
-    if (positional && lseek(host_ref.fd, 0, SEEK_CUR) < 0 && errno == ESPIPE)
-        ret = -LINUX_ESPIPE;
-    if (ret == 0) {
-        int fl = fcntl(host_ref.fd, F_GETFL);
-        int accmode = fl >= 0 ? (fl & O_ACCMODE) : O_RDWR;
-        if (op_is_write ? accmode == O_RDONLY : accmode == O_WRONLY)
-            ret = -LINUX_EBADF;
+    if (snap.type == FD_PATH) {
+        ret = -LINUX_EBADF;
+    } else if (snap.type == FD_USBDEV) {
+        /* usbdevfs is the one type whose host fd says nothing useful and whose
+         * guest-visible mode is nonetheless known: the fd sits on a readiness
+         * pipe, and the open mode lives in the slot's linux_flags. It is
+         * seekable, so only the direction test applies, and it is answered by
+         * the same rule the non-empty calls use rather than by a second
+         * opinion.
+         */
+        ret = op_is_write ? usbdev_write_refused(fd) : usbdev_read_refused(fd);
+    } else if (vec_host_mode_mirrors_guest(snap.type)) {
+        ret = ref_err;
+        if (ret == 0 && positional && lseek(host_ref.fd, 0, SEEK_CUR) < 0 &&
+            errno == ESPIPE)
+            ret = -LINUX_ESPIPE;
+        if (ret == 0) {
+            int fl = fcntl(host_ref.fd, F_GETFL);
+            int accmode = fl >= 0 ? (fl & O_ACCMODE) : O_RDWR;
+            if (op_is_write ? accmode == O_RDONLY : accmode == O_WRONLY)
+                ret = -LINUX_EBADF;
+        }
     }
     host_fd_ref_close(&host_ref);
     return ret;

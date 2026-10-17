@@ -1624,16 +1624,26 @@ static void epoll_instance_unref_locked(epoll_instance_t *inst)
 /* Pin the epoll instance behind epfd for the duration of a call, so a
  * concurrent close(epfd) cannot free it mid-use.
  *
+ * kq is the host kqueue the caller already pinned for epfd, and the instance
+ * has to be the one that kqueue belongs to. The two pins take fd_lock
+ * separately, and a sibling close(epfd) followed by an epoll_create1 that
+ * reuses the number between them would otherwise pair the old kqueue with the
+ * new instance: an ADD would arm its knote on a kqueue nobody waits on and mark
+ * the registration active on the instance everyone does, so it never fires and
+ * a retry answers EEXIST. The host number is a sound witness because the pin
+ * keeps the old kqueue open, so the new instance cannot be handed the same one.
+ *
  * Returns the instance with an extra reference, or NULL if epfd is not a live
- * epoll fd. Balance every non-NULL return with epoll_instance_release().
+ * epoll fd backed by kq. Balance every non-NULL return with
+ * epoll_instance_release().
  */
-static epoll_instance_t *epoll_instance_acquire(int epfd)
+static epoll_instance_t *epoll_instance_acquire(int epfd, int kq)
 {
     if (!RANGE_CHECK(epfd, 0, FD_TABLE_SIZE))
         return NULL;
     pthread_mutex_lock(&fd_lock);
     epoll_instance_t *inst = NULL;
-    if (fd_table[epfd].type == FD_EPOLL) {
+    if (fd_table[epfd].type == FD_EPOLL && fd_table[epfd].host_fd == kq) {
         inst = (epoll_instance_t *) fd_table[epfd].dir;
         if (inst)
             inst->refcount++;
@@ -2087,7 +2097,7 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
      * epoll_ctl(plain_file, ADD, plain_file, &ev) is EPERM while the same call
      * on a pipe is EINVAL.
      */
-    epoll_instance_t *inst = epoll_instance_acquire(epfd);
+    epoll_instance_t *inst = epoll_instance_acquire(epfd, epoll_ref.fd);
     if (!inst) {
         int64_t err = epoll_einval_unless_unsupported(&target_snap);
         host_fd_ref_close(&epoll_ref);
@@ -2688,7 +2698,7 @@ int64_t sys_epoll_pwait(guest_t *g,
     /* Pin the instance so a concurrent close(epfd) cannot free it under us --
      * including across the blocking kevent() below.
      */
-    epoll_instance_t *inst = epoll_instance_acquire(epfd);
+    epoll_instance_t *inst = epoll_instance_acquire(epfd, epoll_ref.fd);
     if (!inst) {
         host_fd_ref_close(&epoll_ref);
         return -LINUX_EINVAL;

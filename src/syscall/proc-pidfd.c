@@ -23,12 +23,20 @@
 
 #define PIDFD_TABLE_SIZE 32
 
+/* An entry belongs to an open file description, not to a guest fd number:
+ * dup(2) and F_DUPFD hand the alias the same ofd_id, and the target stays
+ * watched until the last name for it closes. Keying by number made a dup report
+ * the target exited (the original's close dropped the shared write end) and
+ * answer EBADF to pidfd_send_signal and waitid(P_PIDFD).
+ */
 typedef struct {
     bool active;
-    int guest_fd;
+    uint64_t ofd_id; /* reserved before the slot is published; never 0 */
     int64_t guest_pid;
+    pid_t host_pid; /* what the monitor watches, carried to a fork child */
     int write_end;
-    uint64_t gen; /* names this open across guest fd number reuse */
+    int pins;     /* creations and dups in flight, which no sweep may retire */
+    uint64_t gen; /* names this entry for the monitor thread */
 } pidfd_entry_t;
 
 static pidfd_entry_t pidfd_table[PIDFD_TABLE_SIZE];
@@ -44,10 +52,21 @@ static pidfd_entry_t *pidfd_find_free_entry(void)
     return NULL;
 }
 
-static pidfd_entry_t *pidfd_find_guest_fd_entry(int guest_fd)
+static pidfd_entry_t *pidfd_find_ofd_entry(uint64_t ofd_id)
+{
+    if (ofd_id == 0)
+        return NULL;
+    for (int i = 0; i < PIDFD_TABLE_SIZE; i++) {
+        if (pidfd_table[i].active && pidfd_table[i].ofd_id == ofd_id)
+            return &pidfd_table[i];
+    }
+    return NULL;
+}
+
+static pidfd_entry_t *pidfd_find_gen_entry(uint64_t gen)
 {
     for (int i = 0; i < PIDFD_TABLE_SIZE; i++) {
-        if (pidfd_table[i].active && pidfd_table[i].guest_fd == guest_fd)
+        if (pidfd_table[i].active && pidfd_table[i].gen == gen)
             return &pidfd_table[i];
     }
     return NULL;
@@ -70,13 +89,68 @@ static void pidfd_complete_entry(pidfd_entry_t *entry)
 static void pidfd_complete_one(uint64_t gen)
 {
     pthread_mutex_lock(&pidfd_lock);
-    for (int i = 0; i < PIDFD_TABLE_SIZE; i++) {
-        if (pidfd_table[i].active && pidfd_table[i].gen == gen) {
-            pidfd_complete_entry(&pidfd_table[i]);
-            break;
-        }
-    }
+    pidfd_entry_t *entry = pidfd_find_gen_entry(gen);
+    if (entry)
+        pidfd_complete_entry(entry);
     pthread_mutex_unlock(&pidfd_lock);
+}
+
+/* Retire every unpinned entry no fd_table slot names any more. Caller holds
+ * fd_lock and then pidfd_lock, so the set of live slots cannot change under the
+ * scan. A close hook only learns the number it closed, which by then is already
+ * FD_CLOSED, so asking the table is the one way to tell whether that was the
+ * last alias.
+ */
+static void pidfd_sweep_locked(void)
+{
+    bool live[PIDFD_TABLE_SIZE] = {false};
+    for (int fd = 0; fd < FD_TABLE_SIZE; fd++) {
+        if (fd_table[fd].type != FD_PIDFD)
+            continue;
+        pidfd_entry_t *entry = pidfd_find_ofd_entry(fd_table[fd].ofd_id);
+        if (entry)
+            live[entry - pidfd_table] = true;
+    }
+    for (int i = 0; i < PIDFD_TABLE_SIZE; i++) {
+        pidfd_entry_t *entry = &pidfd_table[i];
+        if (!entry->active || entry->pins > 0 || live[i])
+            continue;
+        if (entry->write_end >= 0)
+            close(entry->write_end);
+        entry->write_end = -1;
+        entry->active = false;
+    }
+}
+
+static void pidfd_sweep(void)
+{
+    pthread_mutex_lock(&fd_lock);
+    pthread_mutex_lock(&pidfd_lock);
+    pidfd_sweep_locked();
+    pthread_mutex_unlock(&pidfd_lock);
+    pthread_mutex_unlock(&fd_lock);
+}
+
+bool pidfd_pin(uint64_t ofd_id)
+{
+    pthread_mutex_lock(&pidfd_lock);
+    pidfd_entry_t *entry = pidfd_find_ofd_entry(ofd_id);
+    if (entry)
+        entry->pins++;
+    pthread_mutex_unlock(&pidfd_lock);
+    return entry != NULL;
+}
+
+void pidfd_unpin(uint64_t ofd_id)
+{
+    pthread_mutex_lock(&fd_lock);
+    pthread_mutex_lock(&pidfd_lock);
+    pidfd_entry_t *entry = pidfd_find_ofd_entry(ofd_id);
+    if (entry)
+        entry->pins--;
+    pidfd_sweep_locked();
+    pthread_mutex_unlock(&pidfd_lock);
+    pthread_mutex_unlock(&fd_lock);
 }
 
 void pidfd_init(void)
@@ -86,15 +160,8 @@ void pidfd_init(void)
 
 static void pidfd_cleanup(int guest_fd)
 {
-    pthread_mutex_lock(&pidfd_lock);
-    pidfd_entry_t *entry = pidfd_find_guest_fd_entry(guest_fd);
-    if (entry) {
-        if (entry->write_end >= 0)
-            close(entry->write_end);
-        entry->write_end = -1;
-        entry->active = false;
-    }
-    pthread_mutex_unlock(&pidfd_lock);
+    (void) guest_fd;
+    pidfd_sweep();
 }
 
 static void *pidfd_monitor_thread(void *arg)
@@ -147,9 +214,38 @@ static void *pidfd_monitor_thread(void *arg)
     return NULL;
 }
 
-int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid)
+static bool pidfd_start_monitor(int64_t target_pid,
+                                pid_t host_pid,
+                                uint64_t gen)
 {
-    (void) g;
+    int64_t *ctx = malloc(3 * sizeof(int64_t));
+    if (!ctx)
+        return false;
+    ctx[0] = target_pid;
+    ctx[1] = (int64_t) host_pid;
+    ctx[2] = (int64_t) gen;
+
+    bool ok = false;
+    pthread_t thr;
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) == 0) {
+        ok = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) == 0 &&
+             pthread_create(&thr, &attr, pidfd_monitor_thread, ctx) == 0;
+        pthread_attr_destroy(&attr);
+    }
+    if (!ok)
+        free(ctx);
+    return ok;
+}
+
+/* fixed_fd >= 0 installs at that slot (the fork rebuild), otherwise at the
+ * lowest free one. exited publishes the fd already complete.
+ */
+static int pidfd_install(int fixed_fd,
+                         int64_t target_pid,
+                         pid_t host_pid,
+                         bool exited)
+{
     int pfd[2];
     if (pipe(pfd) < 0)
         return -LINUX_EMFILE;
@@ -159,64 +255,64 @@ int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid)
         return linux_errno();
     }
 
-    int gfd = fd_alloc(FD_PIDFD, pfd[0], pidfd_cleanup);
-    if (gfd < 0) {
-        close(pfd[0]);
-        close(pfd[1]);
-        return -LINUX_EMFILE;
-    }
-
+    /* Register and bind before publishing: the slot is visible to every sibling
+     * the moment the allocation returns, and a sibling that dups or closes it
+     * must find the entry under the description it names. The description id is
+     * reserved first so the entry carries it from the start; binding after the
+     * publish left a window in which a dup made an alias the registry did not
+     * know and a close then retired the entry under it. The pin keeps a close
+     * sweep from retiring the entry before the slot exists.
+     */
+    uint64_t ofd_id = fd_reserve_ofd_id();
     pthread_mutex_lock(&pidfd_lock);
     pidfd_entry_t *entry = pidfd_find_free_entry();
     if (!entry) {
         pthread_mutex_unlock(&pidfd_lock);
-        fd_entry_t snap;
-        if (fd_snapshot_and_close(gfd, &snap))
-            fd_cleanup_entry(gfd, &snap);
+        close(pfd[0]);
         close(pfd[1]);
         return -LINUX_EMFILE;
     }
-
-    entry->active = true;
-    entry->guest_fd = gfd;
-    entry->guest_pid = target_pid;
-    entry->write_end = pfd[1];
-    entry->gen = ++pidfd_next_gen;
+    *entry = (pidfd_entry_t) {
+        .active = true,
+        .guest_pid = target_pid,
+        .host_pid = host_pid,
+        .write_end = pfd[1],
+        .pins = 1,
+        .gen = ++pidfd_next_gen,
+        .ofd_id = ofd_id,
+    };
     uint64_t gen = entry->gen;
+    if (exited)
+        pidfd_complete_entry(entry);
     pthread_mutex_unlock(&pidfd_lock);
+
+    /* An identity-only alias spec carries the reserved id onto the slot; a
+     * pidfd's pipe cannot block, so the probe the alias path skips would have
+     * decided nothing.
+     */
+    fd_alias_spec_t spec = fd_alias_identity(ofd_id, 0);
+    int gfd = fixed_fd >= 0
+                  ? fd_alloc_alias_at(&spec, fixed_fd, FD_PIDFD, pfd[0],
+                                      pidfd_cleanup, NULL)
+                  : fd_alloc_alias(&spec, FD_PIDFD, pfd[0], pidfd_cleanup);
+
+    /* Drop the pin. If a sibling already closed every name for the description,
+     * or the allocation failed, the sweep retires the entry with its write end.
+     */
+    pidfd_unpin(ofd_id);
+
+    if (gfd < 0) {
+        close(pfd[0]);
+        return -LINUX_EMFILE;
+    }
 
     /* host_pid <= 0 means the target lives inside this host process -- the
      * caller itself, or a CLONE_VM child, which holds a guest tid but no host
      * pid of its own. Neither can be watched from here, and neither has exited,
      * so the fd stays unreadable rather than being completed.
      */
-    if (host_pid <= 0)
+    if (exited || host_pid <= 0)
         return gfd;
-
-    bool monitor_ok = false;
-    {
-        int64_t *ctx = malloc(3 * sizeof(int64_t));
-        if (ctx) {
-            ctx[0] = target_pid;
-            ctx[1] = (int64_t) host_pid;
-            ctx[2] = (int64_t) gen;
-            pthread_t thr;
-            pthread_attr_t attr;
-            if (pthread_attr_init(&attr) == 0) {
-                if (pthread_attr_setdetachstate(&attr,
-                                                PTHREAD_CREATE_DETACHED) == 0 &&
-                    pthread_create(&thr, &attr, pidfd_monitor_thread, ctx) ==
-                        0) {
-                    monitor_ok = true;
-                } else {
-                    free(ctx);
-                }
-                pthread_attr_destroy(&attr);
-            } else {
-                free(ctx);
-            }
-        }
-    }
 
     /* Nothing will ever mark this fd readable without a monitor behind it, so
      * complete it rather than leave the guest polling forever. Only this fd:
@@ -224,10 +320,46 @@ int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid)
      * that has already exited needs no special case: the monitor thread finds
      * it gone and completes the fd the same way.
      */
-    if (!monitor_ok)
+    if (!pidfd_start_monitor(target_pid, host_pid, gen))
         pidfd_complete_one(gen);
 
     return gfd;
+}
+
+int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid)
+{
+    (void) g;
+    return pidfd_install(-1, target_pid, host_pid, false);
+}
+
+void pidfd_fork_snapshot_locked(uint64_t ofd_id, pidfd_fork_state_t *out)
+{
+    *out = (pidfd_fork_state_t) {.target_pid = -1};
+    pthread_mutex_lock(&pidfd_lock);
+    pidfd_entry_t *entry = pidfd_find_ofd_entry(ofd_id);
+    if (entry) {
+        out->target_pid = entry->guest_pid;
+        out->exited = entry->write_end < 0;
+
+        /* A pidfd on this process could not be watched here, but the child is
+         * another host process and can watch this one. A CLONE_VM target stays
+         * unwatched: it has no host pid, and this process outliving it says
+         * nothing about when it exits.
+         */
+        if (entry->guest_pid == proc_get_pid())
+            out->host_pid = getpid();
+        else
+            out->host_pid = entry->host_pid > 0 ? entry->host_pid : 0;
+    }
+    pthread_mutex_unlock(&pidfd_lock);
+}
+
+int pidfd_fork_restore(int guest_fd, const pidfd_fork_state_t *state)
+{
+    if (state->target_pid <= 0)
+        return -LINUX_EBADF;
+    return pidfd_install(guest_fd, state->target_pid, state->host_pid,
+                         state->exited != 0);
 }
 
 void proc_pidfd_notify_exit(int64_t exited_pid)
@@ -242,15 +374,24 @@ void proc_pidfd_notify_exit(int64_t exited_pid)
 
 int64_t proc_pidfd_lookup_pid(int guest_fd)
 {
-    pthread_mutex_lock(&pidfd_lock);
-    pidfd_entry_t *entry = pidfd_find_guest_fd_entry(guest_fd);
-    if (entry) {
-        int64_t pid = entry->guest_pid;
+    if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
+        return -1;
+
+    /* One window over the slot and the registry, so the type check and the
+     * description it names come from the same open: a number closed and reused
+     * in between cannot reach the old target.
+     */
+    int64_t pid = -1;
+    pthread_mutex_lock(&fd_lock);
+    if (fd_table[guest_fd].type == FD_PIDFD) {
+        pthread_mutex_lock(&pidfd_lock);
+        pidfd_entry_t *entry = pidfd_find_ofd_entry(fd_table[guest_fd].ofd_id);
+        if (entry)
+            pid = entry->guest_pid;
         pthread_mutex_unlock(&pidfd_lock);
-        return pid;
     }
-    pthread_mutex_unlock(&pidfd_lock);
-    return -1;
+    pthread_mutex_unlock(&fd_lock);
+    return pid;
 }
 
 int64_t sys_pidfd_open(guest_t *g, int64_t pid, unsigned int flags)

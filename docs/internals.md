@@ -558,7 +558,7 @@ mappings, and any time the host slab cannot accept a fresh overlay at
 the requested VA.
 
 `MAP_SHARED|MAP_ANONYMOUS` is promoted before fork to a memfd-style
-overlay (`mmap_fork_prepare_anon_shared`) and reattached in the child
+overlay (`mmap_fork_prepare_anon_shared_locked`) and reattached in the child
 via `SCM_RIGHTS` (`mmap_fork_restore_overlays`), so cross-fork shared
 anonymous memory stays coherent. Both promotion and overlay are
 disabled for Rosetta because HVF caches host VA-to-PA at `hv_vm_map`
@@ -719,9 +719,9 @@ the backing file and sends the snapshot fd over `SCM_RIGHTS`:
   restore `g->ttbr0` from the IPC header -- `guest_init_from_shm` zeroes
   the struct, and without `ttbr0` page-table walks fail for all high VAs.
 - `MAP_SHARED|MAP_ANONYMOUS` regions are promoted to a memfd-style
-  overlay before fork (`mmap_fork_prepare_anon_shared`) and reattached in
-  the child via SCM_RIGHTS (`mmap_fork_restore_overlays`) so cross-fork
-  shared-memory coherence is preserved.
+  overlay before fork (`mmap_fork_prepare_anon_shared_locked`) and
+  reattached in the child via SCM_RIGHTS (`mmap_fork_restore_overlays`) so
+  cross-fork shared-memory coherence is preserved.
 
 This path is roughly 50x faster than the legacy IPC copy path on large
 guest memories.

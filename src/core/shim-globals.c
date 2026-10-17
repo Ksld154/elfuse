@@ -353,14 +353,18 @@ out:
     urandom_ring_unlock(lock_p);
 }
 
+static _Atomic uint32_t *attn_slot(guest_t *g)
+{
+    return (_Atomic uint32_t *) (cache_base(g) + SHIM_GLOBALS_OFF_ATTN);
+}
+
 /* Bitmask helpers. The slot lives at SHIM_GLOBALS_OFF_ATTN as a uint32;
  * ATTN_BIT_SIGTIMER and ATTN_BIT_CRED partition ownership so the signal/timer
  * lane and the cred-publish lane cannot clobber each other.
  */
 void shim_globals_attn_or(guest_t *g, uint32_t bits)
 {
-    _Atomic uint32_t *slot =
-        (_Atomic uint32_t *) (cache_base(g) + SHIM_GLOBALS_OFF_ATTN);
+    _Atomic uint32_t *slot = attn_slot(g);
 
     /* SEQ_CST rather than ACQ_REL. CRED_BRACKETED needs the contrapositive of
      * release-acquire: a sibling that LDAR-loads attn and sees 0 must also not
@@ -378,8 +382,7 @@ void shim_globals_attn_or(guest_t *g, uint32_t bits)
 
 void shim_globals_attn_and(guest_t *g, uint32_t mask)
 {
-    _Atomic uint32_t *slot =
-        (_Atomic uint32_t *) (cache_base(g) + SHIM_GLOBALS_OFF_ATTN);
+    _Atomic uint32_t *slot = attn_slot(g);
 
     /* RELEASE is sufficient for the clear path: the bracket runs publish_creds
      * BEFORE this clear, and RELEASE here pairs with the shim's LDAR so any
@@ -426,10 +429,29 @@ void shim_globals_recompute_attention(guest_t *g)
      * clear ATTN_BIT_SIGTIMER atomically.
      */
     bool need = proc_exit_group_requested() || signal_attention_needed();
-    if (need)
+    if (need) {
         shim_globals_attn_or(g, ATTN_BIT_SIGTIMER);
-    else
-        shim_globals_attn_and(g, ~ATTN_BIT_SIGTIMER);
+        return;
+    }
+
+    /* This runs after every forwarded syscall on every vCPU, and the bit is
+     * nearly always clear already. An unconditional RMW would take the line
+     * exclusive each time and bounce it between vCPUs, while the EL1 fast paths
+     * read it on every call. Load first and clear only a set bit; the vvar word
+     * gets the same test inside vdso_attention_and.
+     *
+     * Skipping loses nothing. A clear of a clear bit stores the value already
+     * there, and the SIGTIMER lane publishes no data under its clear, so there
+     * is no store for its RELEASE to order; the cred bracket still issues its
+     * own unconditional clear through shim_globals_attn_and. A stale relaxed
+     * read can only leave the bit set, which costs one extra trap and never
+     * drops a delivery.
+     */
+    _Atomic uint32_t *slot = attn_slot(g);
+    if (atomic_load_explicit(slot, memory_order_relaxed) & ATTN_BIT_SIGTIMER)
+        atomic_fetch_and_explicit(slot, ~ATTN_BIT_SIGTIMER,
+                                  memory_order_release);
+    vdso_attention_and(g, ~ATTN_BIT_SIGTIMER);
 }
 
 void shim_globals_set_trace_enabled(guest_t *g, bool enabled)

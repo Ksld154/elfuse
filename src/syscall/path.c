@@ -306,6 +306,12 @@ int path_check_intercept_access(const struct stat *st, int mode, int flags)
  * truncation checks live. A second copy of it would be a second place for a
  * spliced path to be silently shortened into one naming a different file.
  *
+ * @rest may point into @out: a walker that follows a second link splices into
+ * the buffer still holding the remainder of the first splice. The remainder
+ * therefore moves to its final place before anything is written in front of it;
+ * an snprintf over overlapping storage overwrote it with the target. @prefix
+ * and @target must not overlap @out.
+ *
  * Returns 0, or -1 with errno set to ENAMETOOLONG.
  */
 int path_splice_link_target(const char *prefix,
@@ -315,21 +321,26 @@ int path_splice_link_target(const char *prefix,
                             char *out,
                             size_t outsz)
 {
-    int n;
-
     while (*rest == '/')
         rest++;
 
-    if (target[0] == '/' || !prefix)
-        n = snprintf(out, outsz, "%s%s%s", target, *rest ? "/" : "", rest);
-    else
-        n = snprintf(out, outsz, "%.*s%s%s%s", (int) prefix_len, prefix, target,
-                     *rest ? "/" : "", rest);
+    size_t plen =
+        (target[0] == '/' || !prefix) ? 0 : strnlen(prefix, prefix_len);
+    size_t tlen = strlen(target);
+    size_t rlen = strlen(rest);
+    size_t sep = rlen ? 1 : 0;
 
-    if (n < 0 || (size_t) n >= outsz) {
+    if (plen + tlen + sep + rlen >= outsz) {
         errno = ENAMETOOLONG;
         return -1;
     }
+
+    memmove(out + plen + tlen + sep, rest, rlen + 1);
+    if (sep)
+        out[plen + tlen] = '/';
+    memcpy(out + plen, target, tlen);
+    if (plen)
+        memcpy(out, prefix, plen);
     return 0;
 }
 
@@ -342,6 +353,11 @@ static bool path_has_trailing_slash(const char *path)
 
     return len > 1 && path[len - 1] == '/';
 }
+
+static int resolve_proc_dirfd_snap(const fd_entry_t *snap,
+                                   const char *path,
+                                   char *out,
+                                   size_t outsz);
 
 /* Forward-declared: defined below dirfd_guest_base_path(), which it needs. */
 static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
@@ -609,14 +625,28 @@ int path_translate_at(guest_fd_t dirfd,
     if (!path)
         return 0;
 
-    tx->proc_resolved =
-        resolve_proc_at_path(dirfd, path, tx->proc_path, sizeof(tx->proc_path));
+    /* Both resolvers below read the dirfd's entry: its /proc stamp, and whether
+     * it is a FUSE directory. One snapshot answers both, so a relative lookup
+     * takes fd_lock and copies the entry once rather than once each.
+     */
+    fd_entry_t dir_snap;
+    bool dir_open = false;
+    if (dirfd != LINUX_AT_FDCWD && path[0] != '\0' && path[0] != '/')
+        dir_open = fd_snapshot(dirfd, &dir_snap);
+
+    if (dirfd == LINUX_AT_FDCWD)
+        tx->proc_resolved = resolve_proc_at_path(dirfd, path, tx->proc_path,
+                                                 sizeof(tx->proc_path));
+    else if (dir_open)
+        tx->proc_resolved = resolve_proc_dirfd_snap(
+            &dir_snap, path, tx->proc_path, sizeof(tx->proc_path));
     if (tx->proc_resolved < 0)
         return -1;
     if (tx->proc_resolved > 0) {
         tx->guest_path = tx->proc_path;
         tx->intercept_path = tx->proc_path;
-    } else {
+    } else if (dirfd == LINUX_AT_FDCWD || path[0] == '/' ||
+               (dir_open && dir_snap.type == FD_FUSE_DIR)) {
         int fuse_rc = fuse_resolve_at_path(dirfd, path, tx->guest_buf,
                                            sizeof(tx->guest_buf));
         if (fuse_rc < 0)
@@ -1431,9 +1461,18 @@ int resolve_proc_dirfd_path(guest_fd_t dirfd,
      * component).
      */
     fd_entry_t snap;
-    if (!fd_snapshot(dirfd, &snap) ||
-        (snap.type != FD_DIR && snap.type != FD_PATH) ||
-        snap.proc_path[0] == '\0')
+    if (!fd_snapshot(dirfd, &snap))
+        return 0;
+    return resolve_proc_dirfd_snap(&snap, path, out, outsz);
+}
+
+static int resolve_proc_dirfd_snap(const fd_entry_t *snap,
+                                   const char *path,
+                                   char *out,
+                                   size_t outsz)
+{
+    if ((snap->type != FD_DIR && snap->type != FD_PATH) ||
+        snap->proc_path[0] == '\0')
         return 0;
 
     /* Linux resolves a relative name against a dirfd only when the dirfd is a
@@ -1445,13 +1484,13 @@ int resolve_proc_dirfd_path(guest_fd_t dirfd,
      * where the descriptor names itself rather than a child, and fstatat() on
      * an O_PATH fd of a regular file has to keep working.
      */
-    if (snap.type == FD_PATH && path[0] != '\0' &&
-        !proc_path_fd_is_dir(&snap)) {
+    if (snap->type == FD_PATH && path[0] != '\0' &&
+        !proc_path_fd_is_dir(snap)) {
         errno = ENOTDIR;
         return -1;
     }
 
-    if (path_rebuild_under(snap.proc_path, path, out, outsz) < 0)
+    if (path_rebuild_under(snap->proc_path, path, out, outsz) < 0)
         return -1;
     return 1;
 }

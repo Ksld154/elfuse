@@ -30,6 +30,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-fuse-alpine \
         test-fstatat-empty-path \
         test-sysroot-nofollow test-sysroot-chdir test-sysroot-symlink-escape \
+        test-sysroot-symlink-chain-splice \
         test-sysroot-dotdot test-sysroot-openat2-walk \
         test-sysroot-inotify-names test-sysroot-exec-names \
         test-sysroot-interp-fallback test-sysroot-interp-cased \
@@ -44,7 +45,8 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-sysroot-root test-path-fold test-usb-sysfs test-usb-sysfs-sysroot \
         test-usb-sysfs-matrix \
         test-usb-sysfs-overflow test-usbdev-ioctl test-usbdev-faults \
-        test-usbdev-urb-loopback test-usbdev-ioctl-loopback \
+        test-usbdev-urb-loopback test-usbdev-sync-clamp \
+        test-usbdev-ioctl-loopback \
         test-usbdev-ioctl-departed \
         test-dir-fd-budget-union \
         test-dir-backing-drain-error test-dir-union-fd-reuse \
@@ -286,6 +288,7 @@ $(call run-lane,test-usb-sysfs-overflow,per-bus devnum cap under 127-device over
 $(call run-lane,test-usbdev-ioctl,the usbdevfs fd contract without hardware)
 $(call run-lane,test-usbdev-faults,the usbdevfs fd's forced failures)
 $(call run-lane,test-usbdev-urb-loopback,the async URB engine over an IOKit loopback)
+$(call run-lane,test-usbdev-sync-clamp,synchronous usbdevfs IN counts bounded by the request)
 $(call run-lane,test-usbdev-ioctl-loopback,the usbdevfs fd contract with a service behind one node)
 $(call run-lane,test-usbdev-ioctl-departed,the usbdevfs ioctls this layer names on a device that has gone)
 $(call run-lane,test-dir-fd-budget-union,a union directory fd costs one host descriptor)
@@ -332,6 +335,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	$(call run-lane,test-sysroot-tmp-remove,sysroot /tmp remove/rename consistency)
 	$(call run-lane,test-sysroot-case-exact,sysroot byte-exact lookup validation)
 	$(call run-lane,test-sysroot-symlink-escape,sysroot relative-dirfd symlink escape validation)
+	$(call run-lane,test-sysroot-symlink-chain-splice,symlink chains spliced over the unconsumed path)
 	$(call run-lane,test-sysroot-openat2-walk,no-symlinks path walking)
 	$(call run-lane,test-sysroot-dotdot,sysroot '..' resolution)
 	$(call run-lane,test-sysroot-symlink-target,escaped symlink-target resolution)
@@ -480,6 +484,28 @@ test-sysroot-symlink-escape: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-symlink-esc
 	while [ "$$i" -lt "$$depth" ]; do relback="../$$relback"; i=$$((i + 1)); done; \
 	ln -sf "$${relback}$${secret_dir#/}/secret.txt" "$$tmpdir/d1/rel-link"; \
 	$(ELFUSE_BIN) --sysroot "$$tmpdir" $(BUILD_DIR)/test-sysroot-symlink-escape
+
+## Symlink chains of 2 to 5 hops whose names grow at each hop, ending in a
+## directory that holds an absolute link out of the sysroot. Each followed
+## target is longer than the prefix it replaces, which is what overwrote the
+## unconsumed remainder of the path before path_splice_link_target moved it.
+test-sysroot-symlink-chain-splice: $(ELFUSE_BIN) $(BUILD_DIR)/test-symlink-chain-splice
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	secret_dir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir" "$$secret_dir"' EXIT; \
+	mkdir -p "$$tmpdir/d1/realdir"; \
+	ln -s "$$secret_dir" "$$tmpdir/d1/realdir/abs"; \
+	printf ok > "$$secret_dir/secret.txt"; \
+	for pair in 2:b 3:c 4:d 5:e; do \
+		n=$${pair%:*}; letter=$${pair#*:}; prev="l$$n"; i=1; \
+		while [ "$$i" -lt "$$n" ]; do \
+			name=$$(printf "%0$$((4 * i + n))d" 0 | tr 0 "$$letter"); \
+			ln -s "$$name" "$$tmpdir/d1/$$prev"; prev="$$name"; i=$$((i + 1)); \
+		done; \
+		ln -s realdir "$$tmpdir/d1/$$prev"; \
+	done; \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" $(BUILD_DIR)/test-symlink-chain-splice /d1
 
 ## sys_linkat() falls back to symlinkat() when the host linkat() rejects a
 ## hard link to a symlink source. APFS accepts that call directly and would
@@ -1878,6 +1904,10 @@ test-usbdev-urb-loopback: elfuse-loopback $(TEST_DIR)/test-usbdev-urb-loopback
 	ELFUSE_USB_FIXTURE=loopback \
 		$(ELFUSE_LOOPBACK_BIN) $(TEST_DIR)/test-usbdev-urb-loopback \
 		terminate-race
+
+test-usbdev-sync-clamp: elfuse-loopback $(TEST_DIR)/test-usbdev-sync-clamp
+	ELFUSE_USB_FIXTURE=loopback \
+		$(ELFUSE_LOOPBACK_BIN) $(TEST_DIR)/test-usbdev-sync-clamp
 
 ## The same fd contract, with an IOKit service behind one node
 # The seam is per device: the loopback model adds a device and leaves the

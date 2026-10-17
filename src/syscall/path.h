@@ -229,6 +229,7 @@ int path_translate_at(guest_fd_t dirfd,
  * relative target only, and names the directory holding the link; pass NULL
  * when the caller re-anchors another way. One copy, because the concatenation
  * is where a spliced path could be silently shortened into a different one.
+ * @rest may point into @out; @prefix and @target must not.
  *
  * Returns 0, or -1 with errno set to ENAMETOOLONG.
  */

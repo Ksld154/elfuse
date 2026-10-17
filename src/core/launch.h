@@ -26,6 +26,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "core/guest.h"
+
 typedef struct {
     /* Host path to the guest ELF; may be a FUSE-materialized temp when
      * elf_host_temp is set.
@@ -99,3 +101,18 @@ typedef struct {
  * status otherwise.
  */
 int elfuse_launch(const launch_args_t *args);
+
+/* Stop every worker, destroy the vCPUs, then guest_destroy. Lives here rather
+ * than in core/guest.c because the stop needs the thread table and the
+ * exit_group flag, which guest.c does not reach.
+ *
+ * Must be terminal: the caller has to proceed straight to process exit
+ * afterwards. If a worker vCPU is still live past the join cap, HVF teardown
+ * cannot run safely, so this leaks the VM and slab for process exit to reclaim,
+ * and macOS allows only one VM per process, so a non-terminal caller would both
+ * leak and fail to bring up a second VM. All current callers (main() cleanup,
+ * the fork-child run loop) satisfy this. Remaining host-side cleanup (mounts,
+ * heap) is still safe to run after a deferred teardown: it never touches HVF or
+ * guest memory.
+ */
+void launch_destroy_guest(guest_t *g);

@@ -310,6 +310,8 @@ QEMU_SKIP="
     test-scm-creds
     test-proc-fidelity
     test-proc-smap
+    test-fuse-reply
+    test-fuse-exec-abs
 "
 
 # test-session: getpgid/getsid/setsid assume the test is its own session and
@@ -395,6 +397,14 @@ QEMU_SKIP="
 #   per-VMA Shared_Dirty inheritance and exclusion of post-fork VMAs. Real
 #   Linux smaps exposes kernel-owned VMA/page accounting instead, so this is
 #   intentionally not a reference-kernel invariant.
+# test-fuse-reply: probes uniques one past the stalled request, which matches
+#   elfuse's consecutive numbering; a real kernel steps uniques by two and reads
+#   an odd one as an interrupt reply, refusing it with EINVAL, not ENOENT.
+# test-fuse-exec-abs: execs an image its own daemon thread serves. elfuse copies
+#   the image to the host before the exec; a real kernel kills the daemon thread
+#   in execve and then faults the new text in from a mount nobody answers, so
+#   the final exec hangs. elfuse FUSE does not cross a fork, so the daemon cannot
+#   move to its own process.
 
 # Tests that only run under qemu. A test belongs here when it needs a writable,
 # byte-exact root: the elfuse lane runs without a sysroot, and the macOS root is
@@ -721,6 +731,8 @@ run_unit_tests()
     test_rc "$runner" "test-exec-limits" 0 "$bindir/test-exec-limits"
     test_rc "$runner" "test-session" 0 "$bindir/test-session"
     test_rc "$runner" "test-pidfd" 0 "$bindir/test-pidfd"
+    test_check "$runner" "test-pidfd-dup" "0 failed" "$bindir/test-pidfd-dup"
+    test_check "$runner" "test-pidfd-fork" "0 failed" "$bindir/test-pidfd-fork"
 
     printf "\nSignal tests\n"
     test_check "$runner" "test-signal" "PASS|0 failed" "$bindir/test-signal"
@@ -798,6 +810,7 @@ run_unit_tests()
     test_rc "$runner" "test-eventfd-dup" 0 "$bindir/test-eventfd-dup"
     test_rc "$runner" "test-epoll-mt" 0 "$bindir/test-epoll-mt"
     test_rc "$runner" "test-epoll-aba" 0 "$bindir/test-epoll-aba"
+    test_rc "$runner" "test-epoll-epfd-reuse" 0 "$bindir/test-epoll-epfd-reuse"
     test_rc "$runner" "test-large-io-boundary" 0 "$bindir/test-large-io-boundary"
     test_rc "$runner" "test-ioctl-cloexec" 0 "$bindir/test-ioctl-cloexec"
     test_rc "$runner" "test-pty" 0 "$bindir/test-pty"
@@ -856,6 +869,8 @@ run_unit_tests()
         "$bindir/test-socket-shortwrite"
     test_check "$runner" "test-socket-blockwrite-signal" "0 failed" \
         "$bindir/test-socket-blockwrite-signal"
+    test_check "$runner" "test-socket-blocking-send" "0 failed" \
+        "$bindir/test-socket-blocking-send"
     test_check "$runner" "test-socket-accept-contended" "0 failed" \
         "$bindir/test-socket-accept-contended"
     test_check "$runner" "test-socket-waitall" "0 failed" \
@@ -914,12 +929,18 @@ run_unit_tests()
 
     printf "\nScatter-gather I/O\n"
     test_check "$runner" "test-readv-writev" "PASS" "$bindir/test-readv-writev"
+    test_check "$runner" "test-writev-huge-iovec" "0 failed" \
+        "$bindir/test-writev-huge-iovec"
+    test_rc "$runner" "test-symlink-chain-splice" 0 \
+        "$bindir/test-symlink-chain-splice"
 
     printf "\ninotify emulation\n"
     test_check "$runner" "test-inotify" "PASS" "$bindir/test-inotify"
 
     printf "\nPI futex + EINTR regression\n"
     test_check "$runner" "test-futex-pi" "0 failed" "$bindir/test-futex-pi"
+    test_check "$runner" "test-futex-pi-mutex" "0 failed" \
+        "$bindir/test-futex-pi-mutex"
     test_rc "$runner" "test-futex-waitv" 0 "$bindir/test-futex-waitv"
     test_rc "$runner" "test-futex-wake-op" 0 "$bindir/test-futex-wake-op"
     test_check "$runner" "test-futex-timed" "0 failed" \
@@ -969,6 +990,12 @@ run_unit_tests()
 
     printf "\nSysV shared memory\n"
     test_rc "$runner" "test-sysv-shm" 0 "$bindir/test-sysv-shm"
+    test_rc "$runner" "test-sysv-sem" 0 "$bindir/test-sysv-sem"
+    test_rc "$runner" "test-sysv-msg-wait" 0 "$bindir/test-sysv-msg-wait"
+    test_check "$runner" "test-fuse-reply" "test-fuse-reply: ok" \
+        "$bindir/test-fuse-reply"
+    test_check "$runner" "test-fuse-exec-abs" "test-fuse-exec-abs: ok" \
+        "$bindir/test-fuse-exec-abs"
 
     printf "\nCredential/identity emulation\n"
     test_rc "$runner" "test-credentials" 0 "$bindir/test-credentials"

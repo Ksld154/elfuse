@@ -38,7 +38,7 @@
  * allocations or corrupt page table structures.
  */
 static pthread_mutex_t mmap_lock =
-    PTHREAD_MUTEX_INITIALIZER; /* Lock order: 1 */
+    PTHREAD_MUTEX_INITIALIZER; /* Order: see syscall/internal.h */
 
 static _Thread_local bool mmap_lock_owned;
 
@@ -114,11 +114,22 @@ typedef struct {
     char name[sizeof(((guest_region_t *) 0)->name)];
 } region_snapshot_t;
 
+/* Undo record for one boundary split. A split rewrites exactly one entry and
+ * inserts its right half, so restoring that entry and closing the right half's
+ * dup returns the table to its exact pre-split contents without copying the
+ * whole array. Undo records must be applied newest first.
+ */
+typedef struct {
+    int index; /* -1 when the split was a no-op */
+    guest_region_t orig;
+} region_split_undo_t;
+
 static int capture_region_snapshots(guest_t *g,
                                     uint64_t start,
                                     uint64_t end,
                                     region_snapshot_t *snaps,
-                                    int max_snaps);
+                                    int max_snaps,
+                                    region_split_undo_t splits_out[2]);
 static void close_region_snapshots(region_snapshot_t *snaps, int n);
 static int restore_snapshot_overlays_in_place(guest_t *g,
                                               const region_snapshot_t *snaps,
@@ -140,6 +151,9 @@ static int region_count_after_removes(const guest_t *g,
                                       const remove_range_t *ranges,
                                       int nranges)
 {
+    if (nranges == 0)
+        return g->nregions;
+
     int count = 0;
 
     for (int i = 0; i < g->nregions; i++) {
@@ -226,7 +240,7 @@ static void mark_overlay_metadata_range(guest_t *g,
                                         uint64_t overlay_start,
                                         uint64_t overlay_end)
 {
-    for (int i = 0; i < g->nregions; i++) {
+    for (int i = guest_region_first_end_above(g, start); i < g->nregions; i++) {
         guest_region_t *r = &g->regions[i];
         if (r->start >= end)
             break;
@@ -246,7 +260,7 @@ static void mark_overlay_metadata_range(guest_t *g,
  */
 static void mark_region_backing_ro(guest_t *g, uint64_t start, uint64_t end)
 {
-    for (int i = 0; i < g->nregions; i++) {
+    for (int i = guest_region_first_end_above(g, start); i < g->nregions; i++) {
         if (g->regions[i].start >= end)
             break;
         if (g->regions[i].end <= start)
@@ -578,116 +592,90 @@ static void region_clip_overlay(guest_region_t *r)
         region_clear_overlay(r);
 }
 
-/* Region-boundary edits are a prepare step for metadata snapshots. Keep a
- * private copy of the tracker while the boundaries are split so an allocation
- * failure (table capacity or backing-fd dup) cannot publish a half-split
- * tracker. Split-created fds are closed on rollback; the original region fds
- * remain owned by the original array and are restored verbatim.
- */
-typedef struct {
-    guest_region_t *regions;
-    int nregions;
-} region_array_txn_t;
-
-static int begin_region_array_txn(const guest_t *g, region_array_txn_t *txn)
+static int split_regions_at_boundary(guest_t *g,
+                                     uint64_t boundary,
+                                     region_split_undo_t *undo)
 {
-    memset(txn, 0, sizeof(*txn));
-    txn->nregions = g->nregions;
-    if (txn->nregions == 0)
-        return 0;
-
-    txn->regions = malloc((size_t) txn->nregions * sizeof(*txn->regions));
-    if (!txn->regions) {
-        txn->nregions = 0;
-        return -LINUX_ENOMEM;
-    }
-    memcpy(txn->regions, g->regions,
-           (size_t) txn->nregions * sizeof(*txn->regions));
-    return 0;
-}
-
-static bool txn_original_fd_present(const region_array_txn_t *txn, int fd)
-{
-    if (fd < 0)
-        return true;
-    for (int i = 0; i < txn->nregions; i++) {
-        if (txn->regions[i].backing_fd == fd)
-            return true;
-    }
-    return false;
-}
-
-static void rollback_region_array_txn(guest_t *g, region_array_txn_t *txn)
-{
-    if (!txn || !txn->regions)
-        return;
-
-    /* split_regions_at_boundary() only creates new fds; it never closes an
-     * original one. Close those new descriptors before restoring the copy.
-     */
-    for (int i = 0; i < g->nregions; i++) {
-        int fd = g->regions[i].backing_fd;
-        if (fd >= 0 && !txn_original_fd_present(txn, fd))
-            close(fd);
-    }
-    memcpy(g->regions, txn->regions,
-           (size_t) txn->nregions * sizeof(*txn->regions));
-    g->nregions = txn->nregions;
-}
-
-static void finish_region_array_txn(region_array_txn_t *txn)
-{
-    if (!txn)
-        return;
-    free(txn->regions);
-    memset(txn, 0, sizeof(*txn));
-}
-
-static int split_regions_at_boundary(guest_t *g, uint64_t boundary)
-{
+    undo->index = -1;
     if (boundary == 0)
         return 0;
 
-    for (int i = 0; i < g->nregions; i++) {
-        const guest_region_t *r = &g->regions[i];
-        if (boundary <= r->start)
-            break;
-        if (boundary >= r->end)
-            continue;
-        if (g->nregions >= GUEST_MAX_REGIONS) {
-            log_error(
-                "guest: region table full, region split skipped at "
-                "0x%llx",
-                (unsigned long long) boundary);
+    int i = guest_region_first_end_above(g, boundary);
+    if (i >= g->nregions || boundary <= g->regions[i].start)
+        return 0;
+
+    const guest_region_t *r = &g->regions[i];
+    if (g->nregions >= GUEST_MAX_REGIONS) {
+        log_error(
+            "guest: region table full, region split skipped at "
+            "0x%llx",
+            (unsigned long long) boundary);
+        return -LINUX_ENOMEM;
+    }
+
+    guest_region_t left = *r;
+    guest_region_t right = *r;
+    if (right.backing_fd >= 0) {
+        right.backing_fd = dup(right.backing_fd);
+        if (right.backing_fd < 0) {
+            log_error("guest: dup() failed for region split: %s",
+                      strerror(errno));
             return -LINUX_ENOMEM;
         }
-
-        guest_region_t left = *r;
-        guest_region_t right = *r;
-        if (right.backing_fd >= 0) {
-            right.backing_fd = dup(right.backing_fd);
-            if (right.backing_fd < 0) {
-                log_error("guest: dup() failed for region split: %s",
-                          strerror(errno));
-                return -LINUX_ENOMEM;
-            }
-        }
-
-        left.end = boundary;
-        right.offset += boundary - right.start;
-        right.gpa_base += boundary - right.start;
-        right.start = boundary;
-        region_clip_overlay(&left);
-        region_clip_overlay(&right);
-
-        memmove(&g->regions[i + 1], &g->regions[i],
-                (g->nregions - i) * sizeof(guest_region_t));
-        g->regions[i] = left;
-        g->regions[i + 1] = right;
-        g->nregions++;
-        return 0;
     }
+
+    left.end = boundary;
+    right.offset += boundary - right.start;
+    right.gpa_base += boundary - right.start;
+    right.start = boundary;
+    region_clip_overlay(&left);
+    region_clip_overlay(&right);
+
+    undo->index = i;
+    undo->orig = *r;
+    memmove(&g->regions[i + 1], &g->regions[i],
+            (g->nregions - i) * sizeof(guest_region_t));
+    g->regions[i] = left;
+    g->regions[i + 1] = right;
+    g->nregions++;
     return 0;
+}
+
+static void undo_region_split(guest_t *g, const region_split_undo_t *undo)
+{
+    int i = undo->index;
+    if (i < 0)
+        return;
+
+    if (g->regions[i + 1].backing_fd >= 0)
+        close(g->regions[i + 1].backing_fd);
+    g->regions[i] = undo->orig;
+    memmove(&g->regions[i + 1], &g->regions[i + 2],
+            (g->nregions - i - 2) * sizeof(guest_region_t));
+    g->nregions--;
+}
+
+/* Split at both ends of [start, end). On failure the table is unchanged; on
+ * success undo_region_splits() reverts both splits exactly.
+ */
+static int split_regions_at_bounds(guest_t *g,
+                                   uint64_t start,
+                                   uint64_t end,
+                                   region_split_undo_t undo[2])
+{
+    int err = split_regions_at_boundary(g, start, &undo[0]);
+    if (err < 0)
+        return err;
+    err = split_regions_at_boundary(g, end, &undo[1]);
+    if (err < 0)
+        undo_region_split(g, &undo[0]);
+    return err;
+}
+
+static void undo_region_splits(guest_t *g, const region_split_undo_t undo[2])
+{
+    undo_region_split(g, &undo[1]);
+    undo_region_split(g, &undo[0]);
 }
 
 static uint64_t find_free_gap_inner(const guest_t *g,
@@ -864,16 +852,8 @@ static bool high_va_replaceable_gpa_base(guest_t *g,
                                          int *out_flags,
                                          uint64_t *out_offset)
 {
-    int idx = -1;
-    for (int i = 0; i < g->nregions; i++) {
-        if (g->regions[i].end <= start)
-            continue;
-        if (g->regions[i].start > start)
-            return false;
-        idx = i;
-        break;
-    }
-    if (idx < 0)
+    int idx = guest_region_first_end_above(g, start);
+    if (idx >= g->nregions || g->regions[idx].start > start)
         return false;
 
     uint64_t cursor = start;
@@ -1056,7 +1036,7 @@ static int64_t sys_mmap_high_va(guest_t *g,
             return -LINUX_ENOMEM;
         }
         replaced_nsnaps = capture_region_snapshots(
-            g, addr, addr + length, replaced_snaps, GUEST_MAX_REGIONS);
+            g, addr, addr + length, replaced_snaps, GUEST_MAX_REGIONS, NULL);
         if (replaced_nsnaps < 0) {
             if (replaced_remove_fd >= 0)
                 close(replaced_remove_fd);
@@ -1759,7 +1739,8 @@ typedef struct {
     region_snapshot_t *dest_snaps;
     int source_nsnaps;
     int dest_nsnaps;
-    region_array_txn_t txn;
+    region_split_undo_t source_splits[2];
+    region_split_undo_t dest_splits[2];
     int source_remove_fd;
     int dest_remove_fd;
 } mremap_move_t;
@@ -1769,23 +1750,33 @@ static void mremap_move_init(mremap_move_t *move)
     memset(move, 0, sizeof(*move));
     move->track.backing_fd = -1;
     move->track.tail_backing_fd = -1;
+    move->source_splits[0].index = move->source_splits[1].index = -1;
+    move->dest_splits[0].index = move->dest_splits[1].index = -1;
     move->source_remove_fd = -1;
     move->dest_remove_fd = -1;
 }
 
+/* Revert the boundary splits of both captures, newest first. Between the source
+ * capture and the commit nothing else edits regions[], so undoing the splits
+ * alone restores the table exactly. A capture that failed reverted its own
+ * splits and left its records at -1.
+ */
+static void mremap_move_undo_splits(guest_t *g, mremap_move_t *move)
+{
+    undo_region_splits(g, move->dest_splits);
+    undo_region_splits(g, move->source_splits);
+}
+
 /* Release whatever the move still owns, in any state.
  *
- * Rolling the region array back is deliberately not here. Before the array
- * transaction is committed a failing exit has to roll it back, and after the
- * commit it must not, so that choice stays at the exit that knows which side of
- * the commit it is on. This only finishes the transaction, which is safe either
- * way.
+ * Undoing the splits is deliberately not here. Before the commit a failing exit
+ * has to undo them, and after the commit it must not, so that choice stays at
+ * the exit that knows which side of the commit it is on.
  */
 static void mremap_move_dispose(mremap_move_t *move)
 {
     dispose_region_snapshots(&move->dest_snaps, &move->dest_nsnaps);
     dispose_region_snapshots(&move->source_snaps, &move->source_nsnaps);
-    finish_region_array_txn(&move->txn);
     mremap_track_dispose(&move->track);
     close_keep_errno(move->source_remove_fd);
     move->source_remove_fd = -1;
@@ -1797,32 +1788,22 @@ static int capture_region_snapshots(guest_t *g,
                                     uint64_t start,
                                     uint64_t end,
                                     region_snapshot_t *snaps,
-                                    int max_snaps)
+                                    int max_snaps,
+                                    region_split_undo_t splits_out[2])
 {
     /* Split and snapshot as one metadata transaction. A failed boundary split,
      * descriptor dup, or snapshot-capacity check must leave regions[] and its
-     * owned fds exactly as they were on entry.
+     * owned fds exactly as they were on entry. On success the split records go
+     * to splits_out, when given, so a caller can still revert the splits after
+     * the snapshots are disposed.
      */
-    region_array_txn_t txn;
-    int txn_err = begin_region_array_txn(g, &txn);
-    if (txn_err < 0)
-        return txn_err;
-
-    int split_err = split_regions_at_boundary(g, start);
-    if (split_err < 0) {
-        rollback_region_array_txn(g, &txn);
-        finish_region_array_txn(&txn);
+    region_split_undo_t splits[2];
+    int split_err = split_regions_at_bounds(g, start, end, splits);
+    if (split_err < 0)
         return split_err;
-    }
-    split_err = split_regions_at_boundary(g, end);
-    if (split_err < 0) {
-        rollback_region_array_txn(g, &txn);
-        finish_region_array_txn(&txn);
-        return split_err;
-    }
 
     int n = 0;
-    for (int i = 0; i < g->nregions; i++) {
+    for (int i = guest_region_first_end_above(g, start); i < g->nregions; i++) {
         const guest_region_t *r = &g->regions[i];
         if (r->start >= end)
             break;
@@ -1830,8 +1811,7 @@ static int capture_region_snapshots(guest_t *g,
             continue;
         if (n >= max_snaps) {
             close_region_snapshots(snaps, n);
-            rollback_region_array_txn(g, &txn);
-            finish_region_array_txn(&txn);
+            undo_region_splits(g, splits);
             return -LINUX_ENOMEM;
         }
 
@@ -1848,8 +1828,7 @@ static int capture_region_snapshots(guest_t *g,
             snap->backing_fd = dup(r->backing_fd);
             if (snap->backing_fd < 0) {
                 close_region_snapshots(snaps, n);
-                rollback_region_array_txn(g, &txn);
-                finish_region_array_txn(&txn);
+                undo_region_splits(g, splits);
                 return -LINUX_ENOMEM;
             }
         }
@@ -1861,7 +1840,8 @@ static int capture_region_snapshots(guest_t *g,
         str_copy_trunc(snap->name, r->name, sizeof(snap->name));
     }
 
-    finish_region_array_txn(&txn);
+    if (splits_out)
+        memcpy(splits_out, splits, sizeof(splits));
     return n;
 }
 
@@ -2465,7 +2445,8 @@ static int cleanup_overlays_in_range(guest_t *g, uint64_t start, uint64_t end)
      * turn an operation that only reduces mappings into a spurious ENOMEM.
      */
     bool has_overlay = false;
-    for (int i = 0; i < g->nregions; i++) {
+    for (int i = guest_region_first_end_above(g, host_start); i < g->nregions;
+         i++) {
         const guest_region_t *r = &g->regions[i];
         if (r->start >= host_end)
             break;
@@ -2479,23 +2460,10 @@ static int cleanup_overlays_in_range(guest_t *g, uint64_t start, uint64_t end)
     if (!has_overlay)
         return 0;
 
-    region_array_txn_t split_txn;
-    int txn_err = begin_region_array_txn(g, &split_txn);
-    if (txn_err < 0)
-        return txn_err;
-    int split_err = split_regions_at_boundary(g, host_start);
-    if (split_err < 0) {
-        rollback_region_array_txn(g, &split_txn);
-        finish_region_array_txn(&split_txn);
+    region_split_undo_t splits[2];
+    int split_err = split_regions_at_bounds(g, host_start, host_end, splits);
+    if (split_err < 0)
         return split_err;
-    }
-    split_err = split_regions_at_boundary(g, host_end);
-    if (split_err < 0) {
-        rollback_region_array_txn(g, &split_txn);
-        finish_region_array_txn(&split_txn);
-        return split_err;
-    }
-    finish_region_array_txn(&split_txn);
 
     /* Snapshot affected ranges first; the host-side mmap calls below do not
      * touch the region array, but a future caller invariant is to allow this
@@ -2506,7 +2474,8 @@ static int cleanup_overlays_in_range(guest_t *g, uint64_t start, uint64_t end)
         uint64_t off, len;
     } overlays[GUEST_MAX_REGIONS];
     int n = 0;
-    for (int i = 0; i < g->nregions && n < GUEST_MAX_REGIONS; i++) {
+    for (int i = guest_region_first_end_above(g, host_start);
+         i < g->nregions && n < GUEST_MAX_REGIONS; i++) {
         guest_region_t *r = &g->regions[i];
         if (r->start >= host_end)
             break;
@@ -3043,9 +3012,9 @@ int64_t sys_mmap(guest_t *g,
             mmap_fresh_dispose(&fresh);
             return -LINUX_ENOMEM;
         }
-        fresh.replaced_nsnaps =
-            capture_region_snapshots(g, result_off, result_off + length,
-                                     fresh.replaced_snaps, GUEST_MAX_REGIONS);
+        fresh.replaced_nsnaps = capture_region_snapshots(
+            g, result_off, result_off + length, fresh.replaced_snaps,
+            GUEST_MAX_REGIONS, NULL);
         if (fresh.replaced_nsnaps < 0) {
             int64_t capture_err = fresh.replaced_nsnaps;
             mmap_fresh_dispose(&fresh);
@@ -3607,15 +3576,12 @@ int64_t sys_mmap(guest_t *g,
     if (!is_anon && fd >= 0 && !is_prot_none && (flags & LINUX_MAP_SHARED)) {
         size_t hps = host_page_size_cached();
         if ((result_off % hps == 0) && ((uint64_t) offset % hps == 0)) {
-            for (int i = 0; i < g->nregions; i++) {
-                if (g->regions[i].start == result_off &&
-                    g->regions[i].end == result_off + length) {
-                    g->regions[i].overlay_active = true;
-                    g->regions[i].overlay_start = result_off;
-                    g->regions[i].overlay_end =
-                        result_off + ALIGN_UP(length, hps);
-                    break;
-                }
+            int i = guest_region_first_end_above(g, result_off);
+            if (i < g->nregions && g->regions[i].start == result_off &&
+                g->regions[i].end == result_off + length) {
+                g->regions[i].overlay_active = true;
+                g->regions[i].overlay_start = result_off;
+                g->regions[i].overlay_end = result_off + ALIGN_UP(length, hps);
             }
         }
     }
@@ -3832,37 +3798,31 @@ int64_t sys_mremap(guest_t *g,
         }
 
         /* Keep both boundary captures in one transaction. The per-capture
-         * helper rolls back its own edits, while this outer guard also undoes a
-         * successful source capture if destination capture or the preflight
+         * helper rolls back its own edits, while the recorded splits also undo
+         * a successful source capture if destination capture or the preflight
          * shared-file flush fails afterward.
          */
-        int capture_txn_err = begin_region_array_txn(g, &move.txn);
-        if (capture_txn_err < 0) {
-            mremap_move_dispose(&move);
-            return finish_mremap(&source, capture_txn_err);
-        }
-
-        move.source_nsnaps =
-            capture_region_snapshots(g, old_off, old_off + old_size,
-                                     move.source_snaps, GUEST_MAX_REGIONS);
+        move.source_nsnaps = capture_region_snapshots(
+            g, old_off, old_off + old_size, move.source_snaps,
+            GUEST_MAX_REGIONS, move.source_splits);
         if (move.source_nsnaps < 0) {
             int snapshot_err = move.source_nsnaps;
-            rollback_region_array_txn(g, &move.txn);
             mremap_move_dispose(&move);
             return finish_mremap(&source, snapshot_err);
         }
         int rebind_err = rebind_mremap_source_backings(
             &source, move.source_snaps, move.source_nsnaps);
         if (rebind_err < 0) {
-            rollback_region_array_txn(g, &move.txn);
+            mremap_move_undo_splits(g, &move);
             mremap_move_dispose(&move);
             return finish_mremap(&source, rebind_err);
         }
         move.dest_nsnaps = capture_region_snapshots(
-            g, new_off, new_off + new_size, move.dest_snaps, GUEST_MAX_REGIONS);
+            g, new_off, new_off + new_size, move.dest_snaps, GUEST_MAX_REGIONS,
+            move.dest_splits);
         if (move.dest_nsnaps < 0) {
             int snapshot_err = move.dest_nsnaps;
-            rollback_region_array_txn(g, &move.txn);
+            mremap_move_undo_splits(g, &move);
             mremap_move_dispose(&move);
             return finish_mremap(&source, snapshot_err);
         }
@@ -3870,25 +3830,24 @@ int64_t sys_mremap(guest_t *g,
         /* Reserve the backing descriptors needed by both removals before any
          * overlay teardown, page-table changes, or host-memory copies. The
          * snapshots above may split region boundaries, so prepare against the
-         * final metadata shape while the outer transaction can still roll it
-         * back if either reservation fails.
+         * final metadata shape while the recorded splits can still undo it if
+         * either reservation fails.
          */
         if (guest_region_remove_prepare(g, old_off, old_off + old_size,
                                         &move.source_remove_fd) < 0 ||
             guest_region_remove_prepare(g, new_off, new_off + new_size,
                                         &move.dest_remove_fd) < 0) {
-            rollback_region_array_txn(g, &move.txn);
+            mremap_move_undo_splits(g, &move);
             mremap_move_dispose(&move);
             return finish_mremap(&source, -LINUX_ENOMEM);
         }
 
         int64_t flush_err = flush_mremap_source_shared(g, &source);
         if (flush_err < 0) {
-            rollback_region_array_txn(g, &move.txn);
+            mremap_move_undo_splits(g, &move);
             mremap_move_dispose(&move);
             return finish_mremap(&source, flush_err);
         }
-        finish_region_array_txn(&move.txn);
 
         if (source_overlay) {
             int cleanup_err =
@@ -4243,7 +4202,7 @@ static bool madvise_range_mapped(const guest_t *g,
 {
     uint64_t end = off + length;
     uint64_t covered = off;
-    for (int i = 0; i < g->nregions; i++) {
+    for (int i = guest_region_first_end_above(g, off); i < g->nregions; i++) {
         const guest_region_t *r = &g->regions[i];
         if (r->start >= end)
             break;
@@ -4314,7 +4273,8 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
             return -LINUX_ENOMEM;
 
         uint64_t end = off + length;
-        for (int i = 0; i < g->nregions; i++) {
+        for (int i = guest_region_first_end_above(g, off); i < g->nregions;
+             i++) {
             const guest_region_t *r = &g->regions[i];
             if (r->start >= end)
                 break;
@@ -4373,7 +4333,8 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
             return -LINUX_ENOMEM;
 
         uint64_t end = off + length;
-        for (int i = 0; i < g->nregions; i++) {
+        for (int i = guest_region_first_end_above(g, off); i < g->nregions;
+             i++) {
             const guest_region_t *r = &g->regions[i];
             if (r->start >= end)
                 break;
@@ -4461,7 +4422,8 @@ static int munmap_guest_range(guest_t *g, uint64_t unmap_off, uint64_t end)
             close(remove_fd);
         return -LINUX_ENOMEM;
     }
-    for (int i = 0; i < g->nregions; i++) {
+    for (int i = guest_region_first_end_above(g, unmap_off); i < g->nregions;
+         i++) {
         guest_region_t *r = &g->regions[i];
         if (r->start >= end)
             break;
@@ -4939,7 +4901,7 @@ int64_t sys_msync(guest_t *g, uint64_t addr, uint64_t length, int flags)
     }
 
     int64_t ret = 0;
-    for (int i = 0; i < g->nregions; i++) {
+    for (int i = guest_region_first_end_above(g, off); i < g->nregions; i++) {
         guest_region_t *r = &g->regions[i];
         if (r->start >= end)
             break;
@@ -5067,8 +5029,8 @@ static void mmap_fork_dispose_anon_shared_txn(
     *txn_ptr = NULL;
 }
 
-int mmap_fork_prepare_anon_shared(guest_t *g,
-                                  mmap_fork_anon_shared_txn_t **txn_out)
+int mmap_fork_prepare_anon_shared_locked(guest_t *g,
+                                         mmap_fork_anon_shared_txn_t **txn_out)
 {
     /* Callers must provide a non-NULL txn_out: the transaction handle is the
      * only way to commit or abort the partial state mutated below. Reject up
@@ -5082,7 +5044,7 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
     if (!txn)
         return -LINUX_ENOMEM;
 
-    mmap_lock_acquire();
+    assert(mmap_lock_held());
 
     size_t hps = host_page_size_cached();
 
@@ -5194,7 +5156,8 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
         int region_idxs[GUEST_MAX_REGIONS];
         int dup_fds[GUEST_MAX_REGIONS];
         int n_regions = 0;
-        for (int j = 0; j < g->nregions; j++) {
+        for (int j = guest_region_first_end_above(g, start); j < g->nregions;
+             j++) {
             const guest_region_t *r = &g->regions[j];
             if (r->start >= end)
                 break;
@@ -5227,7 +5190,6 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
             for (int k = 0; k < n_regions; k++)
                 close(dup_fds[k]);
             close(fd);
-            mmap_lock_release();
             *txn_out = txn;
             return -LINUX_ENOMEM;
         }
@@ -5235,12 +5197,11 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
         int snap_base = txn->nsnaps;
         int nsnaps =
             capture_region_snapshots(g, start, end, &txn->snaps[txn->nsnaps],
-                                     GUEST_MAX_REGIONS - txn->nsnaps);
+                                     GUEST_MAX_REGIONS - txn->nsnaps, NULL);
         if (nsnaps < 0) {
             for (int k = 0; k < n_regions; k++)
                 close(dup_fds[k]);
             close(fd);
-            mmap_lock_release();
             *txn_out = txn;
             return nsnaps;
         }
@@ -5280,7 +5241,6 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
         close(fd);
     }
 
-    mmap_lock_release();
     *txn_out = txn;
     return 0;
 }
