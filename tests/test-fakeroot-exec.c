@@ -190,7 +190,7 @@ static int copy_program(const char *src, char *dst, size_t dst_sz)
 
     /* mkstemp creates 0600. The copy needs the other-execute bit: its host
      * owner is the real macOS uid, which never matches the emulated guest uid,
-     * so check_exec_permission only ever consults the other bits.
+     * so exec_check_permission only ever consults the other bits.
      */
     int rc = 0;
     if (fchmod(out, 0755) < 0) {

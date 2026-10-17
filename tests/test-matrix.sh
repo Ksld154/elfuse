@@ -310,6 +310,8 @@ QEMU_SKIP="
     test-scm-creds
     test-proc-fidelity
     test-proc-smap
+    test-fuse-reply
+    test-fuse-exec-abs
 "
 
 # test-session: getpgid/getsid/setsid assume the test is its own session and
@@ -395,6 +397,14 @@ QEMU_SKIP="
 #   per-VMA Shared_Dirty inheritance and exclusion of post-fork VMAs. Real
 #   Linux smaps exposes kernel-owned VMA/page accounting instead, so this is
 #   intentionally not a reference-kernel invariant.
+# test-fuse-reply: probes uniques one past the stalled request, which matches
+#   elfuse's consecutive numbering; a real kernel steps uniques by two and reads
+#   an odd one as an interrupt reply, refusing it with EINVAL, not ENOENT.
+# test-fuse-exec-abs: execs an image its own daemon thread serves. elfuse copies
+#   the image to the host before the exec; a real kernel kills the daemon thread
+#   in execve and then faults the new text in from a mount nobody answers, so
+#   the final exec hangs. elfuse FUSE does not cross a fork, so the daemon cannot
+#   move to its own process.
 
 # Tests that only run under qemu. A test belongs here when it needs a writable,
 # byte-exact root: the elfuse lane runs without a sysroot, and the macOS root is
@@ -982,6 +992,10 @@ run_unit_tests()
     test_rc "$runner" "test-sysv-shm" 0 "$bindir/test-sysv-shm"
     test_rc "$runner" "test-sysv-sem" 0 "$bindir/test-sysv-sem"
     test_rc "$runner" "test-sysv-msg-wait" 0 "$bindir/test-sysv-msg-wait"
+    test_check "$runner" "test-fuse-reply" "test-fuse-reply: ok" \
+        "$bindir/test-fuse-reply"
+    test_check "$runner" "test-fuse-exec-abs" "test-fuse-exec-abs: ok" \
+        "$bindir/test-fuse-exec-abs"
 
     printf "\nCredential/identity emulation\n"
     test_rc "$runner" "test-credentials" 0 "$bindir/test-credentials"

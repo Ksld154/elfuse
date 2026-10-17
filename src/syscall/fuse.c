@@ -263,6 +263,7 @@ typedef struct {
 
 typedef struct fuse_request {
     bool used;
+    bool sent;
     bool answered;
     bool no_reply;
     bool detached;
@@ -314,6 +315,11 @@ typedef struct {
     char source[256];
     char fstype[16];
     int mount_id;
+
+    /* The default_permissions mount option: the kernel, not the daemon, judges
+     * access from the inode mode. Decides the exec rule.
+     */
+    bool default_permissions;
 
     /* session is the live transport for this mount; NULL once the owning
      * /dev/fuse fd is closed (the slot is tombstoned, keeping path/source/
@@ -376,6 +382,14 @@ typedef struct {
 static pthread_mutex_t fuse_lock = PTHREAD_MUTEX_INITIALIZER;
 static fuse_session_t fuse_sessions[FUSE_MAX_SESSIONS];
 static fuse_mount_t fuse_mounts[FUSE_MAX_MOUNTS];
+
+/* Set once the first mount is installed and never cleared. path_translate_at
+ * asks fuse_path_matches_mount about every absolute name, and a process that
+ * never mounted FUSE, which is nearly every one, should not pay a path
+ * canonicalization and a fuse_lock round trip for each. A translation racing
+ * the first mount may miss it either way, as it could under the lock.
+ */
+static _Atomic bool fuse_any_mount;
 static fuse_file_t fuse_files[FUSE_MAX_OPEN_FILES];
 static fuse_dev_binding_t fuse_dev_bindings[FD_TABLE_SIZE];
 static fuse_file_binding_t fuse_file_bindings[FD_TABLE_SIZE];
@@ -1593,6 +1607,20 @@ int fuse_proc_stat(struct stat *st)
     return 0;
 }
 
+/* True when the comma-separated mount option list names opt exactly. */
+static bool mount_opt_present(const char *data, const char *opt)
+{
+    size_t n = strlen(opt);
+    for (const char *p = data; p && *p;) {
+        const char *end = strchr(p, ',');
+        size_t len = end ? (size_t) (end - p) : strlen(p);
+        if (len == n && !strncmp(p, opt, n))
+            return true;
+        p = end ? end + 1 : NULL;
+    }
+    return false;
+}
+
 static int parse_mount_fd(const char *data)
 {
     const char *fdp = data ? strstr(data, "fd=") : NULL;
@@ -1703,7 +1731,10 @@ int64_t sys_mount(guest_t *g,
         str_copy_trunc(mount->path, target_canon, sizeof(mount->path));
         str_copy_trunc(mount->source, source, sizeof(mount->source));
         str_copy_trunc(mount->fstype, fstype, sizeof(mount->fstype));
+        mount->default_permissions =
+            mount_opt_present(data, "default_permissions");
         mount->mount_id = fuse_next_mount_id++;
+        atomic_store_explicit(&fuse_any_mount, true, memory_order_release);
     }
     pthread_mutex_unlock(&fuse_lock);
     if (!mount)
@@ -1723,7 +1754,8 @@ int64_t sys_mount(guest_t *g,
 
 bool fuse_path_matches_mount(const char *path)
 {
-    if (!path || path[0] != '/')
+    if (!path || path[0] != '/' ||
+        !atomic_load_explicit(&fuse_any_mount, memory_order_acquire))
         return false;
     char canon[LINUX_PATH_MAX];
     if (fuse_canonical_abs(path, canon, sizeof(canon)) < 0)
@@ -1855,6 +1887,7 @@ static int fuse_materialize_open_file_locked(fuse_session_t *session,
                                              uint64_t nodeid,
                                              uint64_t fh,
                                              int linux_flags,
+                                             const fuse_attr_t *attr,
                                              char *out_path,
                                              size_t outsz)
 {
@@ -1869,10 +1902,27 @@ static int fuse_materialize_open_file_locked(fuse_session_t *session,
     if (tmp_fd < 0)
         return linux_errno();
 
+    /* Host loaders need owner read access; guest credentials may differ from
+     * the host owner, so exec checks the inode before using these execute bits.
+     */
     int rc = 0;
+    if (fchmod(tmp_fd, 0711) < 0)
+        rc = linux_errno();
+
+    /* The looked-up size bounds the copy, as i_size bounds what Linux reads for
+     * an exec. The daemon controls every reply, and session->lock is held
+     * throughout, so an unbounded stream would fill the host temp directory
+     * while stalling every other request on the mount. The size is still the
+     * daemon's own claim: one that reports a huge file can make this copy that
+     * much, which is what any guest write to host storage can do anyway, so the
+     * bound stops a runaway reply rather than a determined daemon.
+     */
+    uint64_t file_size = attr->size;
     uint64_t offset = 0;
-    uint32_t size = session->max_write ? session->max_write : 65536;
-    for (;;) {
+    uint32_t chunk = session->max_write ? session->max_write : 65536;
+    while (rc == 0 && offset < file_size) {
+        uint64_t left = file_size - offset;
+        uint32_t size = left < chunk ? (uint32_t) left : chunk;
         fuse_read_in_t in = {
             .fh = fh,
             .offset = offset,
@@ -1883,21 +1933,14 @@ static int fuse_materialize_open_file_locked(fuse_session_t *session,
         size_t reply_len = 0;
         rc = fuse_request_locked(session, FUSE_READ, nodeid, &in, sizeof(in),
                                  &reply, &reply_len);
-        if (rc < 0) {
-            free(reply);
-            break;
-        }
-        if (reply_len == 0) {
-            free(reply);
-            break;
-        }
-        if (write_all(tmp_fd, reply, reply_len) < 0) {
+        if (rc == 0 && reply_len > size)
+            rc = -LINUX_EIO;
+        if (rc == 0 && reply_len && write_all(tmp_fd, reply, reply_len) < 0)
             rc = linux_errno();
-            free(reply);
-            break;
-        }
-        offset += reply_len;
         free(reply);
+        if (rc < 0 || reply_len < size)
+            break;
+        offset += reply_len;
     }
     if (close(tmp_fd) < 0 && rc == 0)
         rc = linux_errno();
@@ -1911,6 +1954,36 @@ static int fuse_materialize_open_file_locked(fuse_session_t *session,
     return 0;
 }
 
+static bool fuse_mount_default_permissions(int mount_id)
+{
+    bool on = false;
+    pthread_mutex_lock(&fuse_lock);
+    for (int i = 0; i < FUSE_MAX_MOUNTS; i++) {
+        if (fuse_mounts[i].used && fuse_mounts[i].mount_id == mount_id) {
+            on = fuse_mounts[i].default_permissions;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&fuse_lock);
+    return on;
+}
+
+/* Linux's answer to exec of a FUSE inode, decided before anything is copied
+ * out. do_open_execat refuses anything but a regular file, which the copy would
+ * otherwise turn into one. Then fuse_permission: with default_permissions the
+ * kernel judges the mode as for any inode, the way sys_execve does on the host
+ * path; without it access belongs to the daemon, and the kernel refuses an exec
+ * only when no execute bit is set at all.
+ */
+static bool fuse_exec_denied(int mount_id, const struct stat *st)
+{
+    if (!S_ISREG(st->st_mode))
+        return true;
+    if (fuse_mount_default_permissions(mount_id))
+        return exec_check_permission(st) < 0;
+    return (st->st_mode & 0111) == 0;
+}
+
 int fuse_materialize_path(const char *path, char *out_path, size_t outsz)
 {
     fuse_session_t *session = NULL;
@@ -1918,10 +1991,11 @@ int fuse_materialize_path(const char *path, char *out_path, size_t outsz)
     uint64_t nodeid = 0;
     fuse_attr_t attr;
     int rc = fuse_path_lookup(path, true, &session, &mount_id, &nodeid, &attr);
-    (void) mount_id;
     if (rc < 0)
         return rc;
-    if (S_ISDIR(attr.mode)) {
+    struct stat st;
+    fuse_fill_stat_from_attr(&attr, &st);
+    if (fuse_exec_denied(mount_id, &st)) {
         pthread_mutex_lock(&session->lock);
         (void) fuse_node_ref_drop_locked(session, nodeid, 1);
         pthread_mutex_unlock(&session->lock);
@@ -1937,8 +2011,8 @@ int fuse_materialize_path(const char *path, char *out_path, size_t outsz)
     rc = fuse_open_common_locked(session, nodeid, LINUX_O_RDONLY, false, &out);
     if (rc == 0) {
         opened = true;
-        rc = fuse_materialize_open_file_locked(session, nodeid, out.fh,
-                                               LINUX_O_RDONLY, out_path, outsz);
+        rc = fuse_materialize_open_file_locked(
+            session, nodeid, out.fh, LINUX_O_RDONLY, &attr, out_path, outsz);
     }
     if (opened) {
         int rel_rc = fuse_release_common_locked(session, false, nodeid, out.fh,
@@ -2249,8 +2323,12 @@ int fuse_materialize_fd(int fd, char *out_path, size_t outsz)
     }
 
     pthread_mutex_lock(&snap.session->lock);
-    rc = fuse_materialize_open_file_locked(snap.session, snap.nodeid, snap.fh,
-                                           LINUX_O_RDONLY, out_path, outsz);
+    fuse_attr_t attr;
+    rc = fuse_getattr_locked(snap.session, snap.nodeid, &attr);
+    if (rc == 0)
+        rc = fuse_materialize_open_file_locked(snap.session, snap.nodeid,
+                                               snap.fh, LINUX_O_RDONLY, &attr,
+                                               out_path, outsz);
     pthread_mutex_unlock(&snap.session->lock);
     fuse_file_release(&snap);
     return rc;
@@ -2557,6 +2635,7 @@ int64_t fuse_dev_read(int guest_fd,
     if (!session->queue_head)
         session->queue_tail = NULL;
     req->next = NULL;
+    req->sent = true;
     if (!session->queue_head)
         fuse_notify_drain_fd_locked(notify_ref.fd);
     if (req->no_reply)
@@ -2613,11 +2692,19 @@ int64_t fuse_dev_write(guest_t *g,
     pthread_mutex_unlock(&fuse_lock);
 
     pthread_mutex_lock(&session->lock);
+
+    /* Only a request the daemon has read and not yet answered can take a reply,
+     * matching the processing list Linux searches. A queued request is still
+     * linked from queue_head, so letting its waiter free it corrupts the queue;
+     * an answered one would have its reply buffer replaced and leaked. Linux
+     * reports both as an unknown unique.
+     */
     fuse_request_t *req = NULL;
-    for (int i = 0; i < FUSE_MAX_PENDING; i++) {
-        if (session->requests[i].used &&
-            session->requests[i].unique == hdr.unique) {
-            req = &session->requests[i];
+    for (int i = 0; hdr.unique != 0 && i < FUSE_MAX_PENDING; i++) {
+        fuse_request_t *cand = &session->requests[i];
+        if (cand->used && cand->sent && !cand->answered && !cand->no_reply &&
+            cand->unique == hdr.unique) {
+            req = cand;
             break;
         }
     }
@@ -2627,7 +2714,12 @@ int64_t fuse_dev_write(guest_t *g,
         fuse_session_put_locked(session);
         pthread_mutex_unlock(&fuse_lock);
         free(buf);
-        return -LINUX_EINVAL;
+
+        /* Unique 0 is a notification, not a reply. Linux hands it to
+         * fuse_notify, whose answer for a code it does not model is EINVAL, and
+         * no notification is modeled here.
+         */
+        return hdr.unique == 0 ? -LINUX_EINVAL : -LINUX_ENOENT;
     }
 
     req->answered = true;
@@ -2720,12 +2812,6 @@ int64_t fuse_dev_write(guest_t *g,
     pthread_mutex_unlock(&fuse_lock);
     free(buf);
     return (int64_t) count;
-}
-
-bool fuse_is_device_fd(int fd)
-{
-    fd_entry_t snap;
-    return fd_snapshot(fd, &snap) && snap.type == FD_FUSE_DEV;
 }
 
 bool fuse_is_file_fd(int fd)
@@ -2992,8 +3078,27 @@ int fuse_resolve_at_path(guest_fd_t dirfd,
                          char *out,
                          size_t outsz)
 {
-    if (!path || path[0] == '\0' || path[0] == '/')
+    if (!path || path[0] == '\0')
         return 0;
+
+    /* An absolute name ignores dirfd and the cwd, and is FUSE-backed exactly
+     * when it lies under a mount. Answering it here gives every caller that
+     * branches on the translation's FUSE flag (execve materialization, access,
+     * the ENOSYS rejection of unserved path ops) the same answer stat and open
+     * already reach through their own mount checks; without it those callers
+     * act on the host directory the mount covers.
+     */
+    if (path[0] == '/') {
+        if (!fuse_path_matches_mount(path))
+            return 0;
+        size_t len = strlen(path);
+        if (len >= outsz) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        memcpy(out, path, len + 1);
+        return 1;
+    }
 
     if (dirfd != LINUX_AT_FDCWD) {
         fd_entry_t snap;

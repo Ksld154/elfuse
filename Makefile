@@ -682,6 +682,16 @@ $(BUILD_DIR)/test-sysv-msg-wait: tests/test-sysv-msg-wait.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+# test-fuse-exec-abs runs a guest daemon thread serving its own exec image
+$(BUILD_DIR)/test-fuse-exec-abs: tests/test-fuse-exec-abs.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-fuse-reply runs a guest daemon thread against concurrent consumers
+$(BUILD_DIR)/test-fuse-reply: tests/test-fuse-reply.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # test-sched-policy spawns a pthread to verify per-thread TID lookup
 $(BUILD_DIR)/test-sched-policy: tests/test-sched-policy.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"

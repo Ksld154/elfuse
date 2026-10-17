@@ -188,6 +188,13 @@
 #include "linux-limits.h"
 #include "runtime/thread.h"
 
+/* Whether the guest's effective IDs may execute a file with this stat: 0, or a
+ * negative Linux errno. The caller applies the chown overlay first when the
+ * stat came from the host (src/syscall/exec.c).
+ */
+struct stat;
+int exec_check_permission(const struct stat *st);
+
 typedef int guest_fd_t;
 typedef int host_fd_t;
 
