@@ -663,6 +663,14 @@ int fd_alloc_from(int minfd,
     return fd;
 }
 
+uint64_t fd_reserve_ofd_id(void)
+{
+    pthread_mutex_lock(&fd_lock);
+    uint64_t id = fd_next_ofd_id++;
+    pthread_mutex_unlock(&fd_lock);
+    return id;
+}
+
 /* The alias-aware entry points. Each is the plain allocator with the
  * inheritance bracketed around it, so a caller states what it is claiming and
  * cannot leave the claim set behind.

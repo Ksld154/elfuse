@@ -299,10 +299,11 @@ int fork_ipc_send_fd_table(int ipc_sock)
          * syscall/internal.h for the rationale (kqueue cannot cross SCM_RIGHTS
          * on macOS, per-class side tables are not serialized). The child sees
          * these slots as FD_CLOSED and recreates them via the appropriate
-         * syscall.
+         * syscall. A pidfd is the exception: its side table is one target pid,
+         * which rides in the entry, and Linux hands it to the child.
          */
         int t = fd_table[i].type;
-        if (fd_type_is_synthetic(t))
+        if (fd_type_is_synthetic(t) && t != FD_PIDFD)
             continue;
 
         /* Pin rather than dup. SCM_RIGHTS does not consume the sender's
@@ -335,6 +336,10 @@ int fork_ipc_send_fd_table(int ipc_sock)
         fd_entries[num_fds].fasync_owner = fd_table[i].fasync_owner;
         memcpy(fd_entries[num_fds].proc_path, fd_table[i].proc_path,
                sizeof(fd_entries[num_fds].proc_path));
+        fd_entries[num_fds].pidfd = (pidfd_fork_state_t) {.target_pid = -1};
+        if (t == FD_PIDFD)
+            pidfd_fork_snapshot_locked(fd_table[i].ofd_id,
+                                       &fd_entries[num_fds].pidfd);
         host_fds_to_send[num_fds] = host_fd;
         host_fd_pins[num_fds] = pin;
         num_fds++;
@@ -374,6 +379,28 @@ fail:
     return -1;
 }
 
+/* Rebuild one inherited pidfd slot. The first slot of a description gets its
+ * own pipe, registry entry and monitor; a later alias (child_ofd already
+ * assigned) dups that slot's pipe, src_host, so both stay names for one entry.
+ */
+static int fork_rebuild_pidfd(int gfd,
+                              uint64_t child_ofd,
+                              int src_host,
+                              const ipc_fd_entry_t *e)
+{
+    if (!child_ofd)
+        return pidfd_fork_restore(gfd, &e->pidfd);
+    int h = fcntl(src_host, F_DUPFD_CLOEXEC, 0);
+    if (h < 0)
+        return -1;
+    fd_alias_spec_t spec = fd_alias_identity(child_ofd, e->linux_flags);
+    int rc = fd_alloc_alias_at(&spec, gfd, FD_PIDFD, h,
+                               fd_cleanup_for_type(FD_PIDFD), NULL);
+    if (rc < 0)
+        close(h);
+    return rc;
+}
+
 int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
 {
     (void) g;
@@ -410,7 +437,9 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
     bool low_fd_present[3] = {false, false, false};
     for (uint32_t i = 0; i < num_fds; i++) {
         int gfd = fd_entries[i].guest_fd;
-        if (RANGE_CHECK(gfd, 0, 3) && !fd_type_is_synthetic(fd_entries[i].type))
+        int t = fd_entries[i].type;
+        if (RANGE_CHECK(gfd, 0, 3) &&
+            (!fd_type_is_synthetic(t) || t == FD_PIDFD))
             low_fd_present[gfd] = true;
     }
     for (int fd = 0; fd < 3; fd++)
@@ -486,6 +515,28 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
             fd_table[gfd].path_poll_capable =
                 fd_entries[i].path_poll_capable != 0;
             fd_table[gfd].seals = fd_entries[i].seals;
+        } else if (fd_entries[i].type == FD_PIDFD) {
+            /* The descriptor that arrived is the parent's pipe, whose write end
+             * the parent's monitor completes and whose last parent close would
+             * read as the target exiting. The child builds its own instead,
+             * once per description: a later alias dups the first slot's pipe,
+             * so both stay names for one registry entry.
+             */
+            close(host_fds[i]);
+            if (fork_rebuild_pidfd(gfd, child_ofd, shared_dir_host,
+                                   &fd_entries[i]) < 0) {
+                /* Fatal, not a dropped slot: a fork that succeeds with an
+                 * inherited pidfd missing hands the child EBADF on a descriptor
+                 * Linux would have given it.
+                 */
+                log_error("fork-child: could not rebuild pidfd %d", gfd);
+                for (uint32_t j = i + 1; j < num_fds; j++)
+                    close(host_fds[j]);
+                free(host_fds);
+                free(fd_entries);
+                return -1;
+            }
+            fd_table[gfd].linux_flags = fd_entries[i].linux_flags;
         } else if (fd_type_is_synthetic(fd_entries[i].type)) {
             /* Defense in depth: the parent's fork_ipc_send_fd_table already
              * filters synthetic types out of the SCM_RIGHTS payload (see

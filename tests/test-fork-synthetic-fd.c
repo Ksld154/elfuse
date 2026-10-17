@@ -5,9 +5,9 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * The fork-IPC handoff does NOT serialize per-class side tables for
- * eventfd/signalfd/timerfd/inotify/netlink/pidfd. Restoring the inherited host
- * fd without that state leaves a half-functional slot, so fork-state.c
- * explicitly drops these in the child. This test pins that contract:
+ * eventfd/signalfd/timerfd/inotify/netlink. Restoring the inherited host fd
+ * without that state leaves a half-functional slot, so fork-state.c explicitly
+ * drops these in the child. This test pins that contract:
  *   - urandom IS inherited (no per-class state to lose; cache is fresh
  *     in the child and arc4random_buf works)
  *   - eventfd / signalfd / timerfd / inotify are NOT inherited; the

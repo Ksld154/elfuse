@@ -14,12 +14,13 @@
 
 #include "core/guest.h"
 #include "syscall/linux-wire.h"
+#include "syscall/proc-pidfd.h"
 #include "syscall/signal.h"
 
 /* Fork IPC protocol identity. Bump this whenever the header layout or ordered
  * fork payload changes incompatibly.
  */
-#define FORK_IPC_PROTOCOL_MAGIC 0x454C4651U /* "ELFQ" */
+#define FORK_IPC_PROTOCOL_MAGIC 0x454C4652U /* "ELFR" */
 
 #define IPC_MAGIC_HEADER FORK_IPC_PROTOCOL_MAGIC
 #define IPC_MAGIC_SENTINEL 0x454C4F4BU /* "ELOK" */
@@ -123,6 +124,12 @@ typedef struct {
      */
     int32_t foreign_description, nonblock_owned, path_poll_capable;
     char proc_path[FD_VIRTUAL_PATH_MAX];
+
+    /* FD_PIDFD only: the target a pidfd names lives in the parent's registry,
+     * not in the pipe that travels over SCM_RIGHTS, so the child rebuilds the
+     * description from this rather than from the descriptor.
+     */
+    pidfd_fork_state_t pidfd;
 } ipc_fd_entry_t;
 
 int fork_ipc_write_all(int fd, const void *buf, size_t len);
