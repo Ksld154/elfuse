@@ -54,6 +54,7 @@
 #include "runtime/procemu.h"
 #include "runtime/usb-desc.h"
 #include "runtime/usb-fixture.h"
+#include "runtime/usb-ioreg.h"
 #include "runtime/usb-sysfs.h"
 #include "syscall/internal.h"
 #include "syscall/linux-wire.h"
@@ -99,43 +100,6 @@ static usb_dev_t *usb_devs;         /* grown on demand; see USB_DEVS_INIT_CAP */
 static int usb_ndevs;
 static int usb_devs_cap;
 static pid_t usb_owner_pid;
-
-/* IOKit property helpers */
-
-static long ioreg_num(io_service_t s, const char *key)
-{
-    CFStringRef k = CFStringCreateWithCString(kCFAllocatorDefault, key,
-                                              kCFStringEncodingUTF8);
-    if (!k)
-        return -1;
-    CFTypeRef v = IORegistryEntryCreateCFProperty(s, k, kCFAllocatorDefault, 0);
-    CFRelease(k);
-    long n = -1;
-    if (v && CFGetTypeID(v) == CFNumberGetTypeID())
-        CFNumberGetValue((CFNumberRef) v, kCFNumberLongType, &n);
-    if (v)
-        CFRelease(v);
-    return n;
-}
-
-static bool ioreg_str(io_service_t s, const char *key, char *out, size_t n)
-{
-    CFStringRef k = CFStringCreateWithCString(kCFAllocatorDefault, key,
-                                              kCFStringEncodingUTF8);
-    if (!k)
-        return false;
-    CFTypeRef v = IORegistryEntryCreateCFProperty(s, k, kCFAllocatorDefault, 0);
-    CFRelease(k);
-    out[0] = '\0';
-    bool ok = false;
-    if (v && CFGetTypeID(v) == CFStringGetTypeID())
-        ok = CFStringGetCString((CFStringRef) v, out, (CFIndex) n,
-                                kCFStringEncodingUTF8) &&
-             out[0] != '\0';
-    if (v)
-        CFRelease(v);
-    return ok;
-}
 
 /* Port path from locationID nibbles below the top (bus) byte; empty for a root
  * hub (nusb parse_location_id).
@@ -541,9 +505,9 @@ static void model_build(void)
             IOObjectRelease(svc);
             break;
         }
-        long loc = ioreg_num(svc, "locationID");
-        long vid = ioreg_num(svc, "idVendor");
-        long pid = ioreg_num(svc, "idProduct");
+        long loc = usb_ioreg_num(svc, "locationID");
+        long vid = usb_ioreg_num(svc, "idVendor");
+        long pid = usb_ioreg_num(svc, "idProduct");
         if (loc < 0 || vid < 0 || pid < 0) {
             IOObjectRelease(svc);
             continue;
@@ -573,49 +537,53 @@ static void model_build(void)
          * stable: the top byte is constant per controller.
          */
         d->busnum = (int) ((uint32_t) loc >> 24) + 1;
-        long addr = ioreg_num(svc, "USB Address");
+        long addr = usb_ioreg_num(svc, "USB Address");
         if (addr < 0)
-            addr = ioreg_num(svc, "kUSBAddress");
+            addr = usb_ioreg_num(svc, "kUSBAddress");
         d->devnum = addr > 0 && addr < 128 ? (int) addr : 0;
         d->vid = (unsigned) vid & 0xffff;
         d->pid = (unsigned) pid & 0xffff;
 
         long v;
         d->bcd_device =
-            (v = ioreg_num(svc, "bcdDevice")) >= 0 ? (unsigned) v : 0;
+            (v = usb_ioreg_num(svc, "bcdDevice")) >= 0 ? (unsigned) v : 0;
         d->bcd_usb =
-            (v = ioreg_num(svc, "bcdUSB")) >= 0 ? (unsigned) v : 0x0200;
+            (v = usb_ioreg_num(svc, "bcdUSB")) >= 0 ? (unsigned) v : 0x0200;
         d->dev_class =
-            (v = ioreg_num(svc, "bDeviceClass")) >= 0 ? (unsigned) v : 0;
+            (v = usb_ioreg_num(svc, "bDeviceClass")) >= 0 ? (unsigned) v : 0;
         d->dev_subclass =
-            (v = ioreg_num(svc, "bDeviceSubClass")) >= 0 ? (unsigned) v : 0;
+            (v = usb_ioreg_num(svc, "bDeviceSubClass")) >= 0 ? (unsigned) v : 0;
         d->dev_protocol =
-            (v = ioreg_num(svc, "bDeviceProtocol")) >= 0 ? (unsigned) v : 0;
-        d->num_configs =
-            (v = ioreg_num(svc, "bNumConfigurations")) > 0 ? (unsigned) v : 1;
+            (v = usb_ioreg_num(svc, "bDeviceProtocol")) >= 0 ? (unsigned) v : 0;
+        d->num_configs = (v = usb_ioreg_num(svc, "bNumConfigurations")) > 0
+                             ? (unsigned) v
+                             : 1;
         d->max_packet0 =
-            (v = ioreg_num(svc, "bMaxPacketSize0")) > 0 ? (unsigned) v : 64;
+            (v = usb_ioreg_num(svc, "bMaxPacketSize0")) > 0 ? (unsigned) v : 64;
         d->speed_code =
-            (v = ioreg_num(svc, "Device Speed")) >= 0 ? (unsigned) v : 1;
+            (v = usb_ioreg_num(svc, "Device Speed")) >= 0 ? (unsigned) v : 1;
         d->i_manufacturer =
-            (v = ioreg_num(svc, "iManufacturer")) > 0 ? (unsigned) v : 0;
-        d->i_product = (v = ioreg_num(svc, "iProduct")) > 0 ? (unsigned) v : 0;
+            (v = usb_ioreg_num(svc, "iManufacturer")) > 0 ? (unsigned) v : 0;
+        d->i_product =
+            (v = usb_ioreg_num(svc, "iProduct")) > 0 ? (unsigned) v : 0;
         d->i_serial =
-            (v = ioreg_num(svc, "iSerialNumber")) > 0 ? (unsigned) v : 0;
-        d->cfg_value = (v = ioreg_num(svc, "kUSBCurrentConfiguration")) > 0
+            (v = usb_ioreg_num(svc, "iSerialNumber")) > 0 ? (unsigned) v : 0;
+        d->cfg_value = (v = usb_ioreg_num(svc, "kUSBCurrentConfiguration")) > 0
                            ? (unsigned) v
                            : 0;
 
-        if (!ioreg_str(svc, "kUSBVendorString", d->manufacturer,
-                       sizeof(d->manufacturer)))
-            ioreg_str(svc, "USB Vendor Name", d->manufacturer,
-                      sizeof(d->manufacturer));
-        if (!ioreg_str(svc, "kUSBProductString", d->product,
-                       sizeof(d->product)))
-            ioreg_str(svc, "USB Product Name", d->product, sizeof(d->product));
-        if (!ioreg_str(svc, "kUSBSerialNumberString", d->serial,
-                       sizeof(d->serial)))
-            ioreg_str(svc, "USB Serial Number", d->serial, sizeof(d->serial));
+        if (!usb_ioreg_str(svc, "kUSBVendorString", d->manufacturer,
+                           sizeof(d->manufacturer)))
+            usb_ioreg_str(svc, "USB Vendor Name", d->manufacturer,
+                          sizeof(d->manufacturer));
+        if (!usb_ioreg_str(svc, "kUSBProductString", d->product,
+                           sizeof(d->product)))
+            usb_ioreg_str(svc, "USB Product Name", d->product,
+                          sizeof(d->product));
+        if (!usb_ioreg_str(svc, "kUSBSerialNumberString", d->serial,
+                           sizeof(d->serial)))
+            usb_ioreg_str(svc, "USB Serial Number", d->serial,
+                          sizeof(d->serial));
 
         /* "<bus>-<port[.port]*>" (usb.c:704-726) and devpath */
         size_t off = 0;

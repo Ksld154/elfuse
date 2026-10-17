@@ -44,7 +44,8 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-sysroot-root test-path-fold test-usb-sysfs test-usb-sysfs-sysroot \
         test-usb-sysfs-matrix \
         test-usb-sysfs-overflow test-usbdev-ioctl test-usbdev-faults \
-        test-usbdev-urb-loopback test-usbdev-ioctl-loopback \
+        test-usbdev-urb-loopback test-usbdev-sync-clamp \
+        test-usbdev-ioctl-loopback \
         test-usbdev-ioctl-departed \
         test-dir-fd-budget-union \
         test-dir-backing-drain-error test-dir-union-fd-reuse \
@@ -286,6 +287,7 @@ $(call run-lane,test-usb-sysfs-overflow,per-bus devnum cap under 127-device over
 $(call run-lane,test-usbdev-ioctl,the usbdevfs fd contract without hardware)
 $(call run-lane,test-usbdev-faults,the usbdevfs fd's forced failures)
 $(call run-lane,test-usbdev-urb-loopback,the async URB engine over an IOKit loopback)
+$(call run-lane,test-usbdev-sync-clamp,synchronous usbdevfs IN counts bounded by the request)
 $(call run-lane,test-usbdev-ioctl-loopback,the usbdevfs fd contract with a service behind one node)
 $(call run-lane,test-usbdev-ioctl-departed,the usbdevfs ioctls this layer names on a device that has gone)
 $(call run-lane,test-dir-fd-budget-union,a union directory fd costs one host descriptor)
@@ -1878,6 +1880,10 @@ test-usbdev-urb-loopback: elfuse-loopback $(TEST_DIR)/test-usbdev-urb-loopback
 	ELFUSE_USB_FIXTURE=loopback \
 		$(ELFUSE_LOOPBACK_BIN) $(TEST_DIR)/test-usbdev-urb-loopback \
 		terminate-race
+
+test-usbdev-sync-clamp: elfuse-loopback $(TEST_DIR)/test-usbdev-sync-clamp
+	ELFUSE_USB_FIXTURE=loopback \
+		$(ELFUSE_LOOPBACK_BIN) $(TEST_DIR)/test-usbdev-sync-clamp
 
 ## The same fd contract, with an IOKit service behind one node
 # The seam is per device: the loopback model adds a device and leaves the

@@ -144,6 +144,7 @@
 
 #include "core/guest.h"
 #include "debug/log.h"
+#include "runtime/usb-ioreg.h"
 #include "runtime/usb-sysfs.h"
 #include "syscall/internal.h"
 #include "syscall/io.h"
@@ -885,46 +886,6 @@ static int64_t ioret_neg_errno(IOReturn r)
     }
 }
 
-/* IOKit helpers */
-
-static long usbdev_ioreg_num(io_service_t s, const char *key)
-{
-    CFStringRef k = CFStringCreateWithCString(kCFAllocatorDefault, key,
-                                              kCFStringEncodingUTF8);
-    if (!k)
-        return -1;
-    CFTypeRef v = IORegistryEntryCreateCFProperty(s, k, kCFAllocatorDefault, 0);
-    CFRelease(k);
-    long n = -1;
-    if (v && CFGetTypeID(v) == CFNumberGetTypeID())
-        CFNumberGetValue((CFNumberRef) v, kCFNumberLongType, &n);
-    if (v)
-        CFRelease(v);
-    return n;
-}
-
-static bool usbdev_ioreg_str(io_service_t s,
-                             const char *key,
-                             char *out,
-                             size_t n)
-{
-    CFStringRef k = CFStringCreateWithCString(kCFAllocatorDefault, key,
-                                              kCFStringEncodingUTF8);
-    if (!k)
-        return false;
-    CFTypeRef v = IORegistryEntryCreateCFProperty(s, k, kCFAllocatorDefault, 0);
-    CFRelease(k);
-    out[0] = '\0';
-    bool ok = false;
-    if (v && CFGetTypeID(v) == CFStringGetTypeID())
-        ok = CFStringGetCString((CFStringRef) v, out, (CFIndex) n,
-                                kCFStringEncodingUTF8) &&
-             out[0] != '\0';
-    if (v)
-        CFRelease(v);
-    return ok;
-}
-
 /* The modeled bus/dev numbers name a device observed at model-build time; the
  * locationID they map back to names a PORT. If the device was swapped since
  * (unplug + different device into the same port, model not rebuilt), the
@@ -937,8 +898,8 @@ static bool usbdev_identity_matches(io_service_t svc,
                                     unsigned want_pid,
                                     const char *want_serial)
 {
-    long vid = usbdev_ioreg_num(svc, "idVendor");
-    long pid = usbdev_ioreg_num(svc, "idProduct");
+    long vid = usb_ioreg_num(svc, "idVendor");
+    long pid = usb_ioreg_num(svc, "idProduct");
     if (vid != (long) want_vid || pid != (long) want_pid)
         return false;
 
@@ -948,7 +909,7 @@ static bool usbdev_identity_matches(io_service_t svc,
      * anything. One lookup, one spelling.
      */
     char serial[128] = "";
-    (void) usbdev_ioreg_str(svc, "USB Serial Number", serial, sizeof(serial));
+    (void) usb_ioreg_str(svc, "USB Serial Number", serial, sizeof(serial));
     return strcmp(serial, want_serial) == 0;
 }
 
@@ -966,7 +927,7 @@ static io_service_t usbdev_service_for_location(uint32_t location_id)
     io_service_t svc;
     while ((svc = IOIteratorNext(it))) {
         if (found == IO_OBJECT_NULL &&
-            usbdev_ioreg_num(svc, "locationID") == (long) location_id) {
+            usb_ioreg_num(svc, "locationID") == (long) location_id) {
             found = svc; /* keep the iterator's reference */
             continue;
         }
@@ -1147,7 +1108,7 @@ static io_service_t usbdev_iface_service(usbdev_t *u,
     io_service_t svc;
     while ((svc = IOIteratorNext(it))) {
         if (found == IO_OBJECT_NULL &&
-            usbdev_ioreg_num(svc, "bInterfaceNumber") == (long) ifnum) {
+            usb_ioreg_num(svc, "bInterfaceNumber") == (long) ifnum) {
             found = svc;
             continue;
         }
@@ -3575,7 +3536,10 @@ static int64_t usbdev_do_control(usbdev_t *u, guest_t *g, uint64_t arg)
              */
             ret = err;
         } else {
-            int64_t actlen = req.wLenDone;
+            /* wLenDone is device-supplied; bound it by the bounce buffer, as
+             * the async completion does.
+             */
+            int64_t actlen = usbdev_urb_clamp_actual(req.wLenDone, ct.wLength);
             ret = in && actlen > 0 &&
                           guest_write(g, ct.data, buf, (size_t) actlen) < 0
                       ? -LINUX_EFAULT
@@ -3647,6 +3611,7 @@ static int64_t usbdev_do_bulk(usbdev_t *u, guest_t *g, uint64_t arg)
         UInt32 size = bt.len;
         IOReturn r = (*fi->intf)->ReadPipeTO(fi->intf, pipe, buf, &size,
                                              bt.timeout, bt.timeout);
+        size = usbdev_urb_clamp_actual(size, bt.len); /* device-supplied */
         int64_t err = usbdev_ioret_op(u, r);
         if (err < 0) {
             ret = err; /* partial data not copied on error, as Linux */

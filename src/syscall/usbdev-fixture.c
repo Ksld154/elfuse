@@ -81,6 +81,13 @@
  *              rather than about the wire, 4 bytes little-endian. One so far:
  *              how many times the device interface was Released with a control
  *              transfer still outstanding on it.
+ *   0x40 0xF5  make every later synchronous data transfer (DeviceRequestTO
+ *              and ReadPipeTO) report wValue bytes more than it moved, until
+ *              0xF3. The async script reaches the same clamp with ok(n); the
+ *              synchronous entry points consult no script, and an
+ *              over-reporting device is the input their copy-out has to bound.
+ *              Only the count is inflated: the fixture never writes past the
+ *              buffer it was handed.
  */
 
 #include <pthread.h>
@@ -211,6 +218,7 @@ typedef struct {
      * FX_CMD_STATS, so a scenario can assert on it after the fd is gone.
      */
     uint32_t dev_release_inflight;
+    uint32_t sync_overreport; /* FX_CMD_OVERREPORT */
     uint64_t t0_ms;
     struct {
         bool used;
@@ -768,6 +776,7 @@ static IOReturn fx_abort(fx_dev_t *d, uint8_t ep)
 #define FX_CMD_TERMINATE 0xf2
 #define FX_CMD_RESET 0xf3
 #define FX_CMD_STATS 0xf4
+#define FX_CMD_OVERREPORT 0xf5
 
 /* wIndex flags on FX_CMD_TERMINATE (see the control plane above) */
 #define FX_TERM_PIPES 0x2u
@@ -850,6 +859,11 @@ static bool fx_command(fx_dev_t *d, IOUSBDevRequestTO *req, IOReturn *out)
         }
         return true;
     }
+    case FX_CMD_OVERREPORT:
+        pthread_mutex_lock(&usbdev_fixture_lock);
+        d->sync_overreport = req->wValue;
+        pthread_mutex_unlock(&usbdev_fixture_lock);
+        return true;
     case FX_CMD_RESET:
         pthread_mutex_lock(&usbdev_fixture_lock);
         d->nlog = 0;
@@ -859,6 +873,7 @@ static bool fx_command(fx_dev_t *d, IOUSBDevRequestTO *req, IOReturn *out)
         d->pipes_gone = false;
         d->aborts_gone = false;
         d->dev_release_inflight = 0;
+        d->sync_overreport = 0;
         memset(d->zlp_fail, 0, sizeof(d->zlp_fail));
         pthread_mutex_unlock(&usbdev_fixture_lock);
         return true;
@@ -978,7 +993,7 @@ static IOReturn fx_dev_request_to(void *self, IOUSBDevRequestTO *req)
         fx_store_out(d, req->pData, req->wLength);
     int idx = fx_log_open(d, 4, 0, in, req->wLength, in ? NULL : req->pData, 1);
     fx_log_close(d, idx, n, kIOReturnSuccess, in ? req->pData : NULL);
-    req->wLenDone = n;
+    req->wLenDone = n + d->sync_overreport;
     pthread_mutex_unlock(&usbdev_fixture_lock);
     return kIOReturnSuccess;
 }
@@ -1145,7 +1160,7 @@ static IOReturn fx_read_pipe_to(void *self,
     uint32_t n = fx_fill_in(d, buf, *size);
     int idx = fx_log_open(d, 2, ep, true, *size, NULL, 1);
     fx_log_close(d, idx, n, kIOReturnSuccess, buf);
-    *size = n;
+    *size = n + d->sync_overreport;
     pthread_mutex_unlock(&usbdev_fixture_lock);
     return kIOReturnSuccess;
 }
