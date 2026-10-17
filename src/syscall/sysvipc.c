@@ -14,6 +14,7 @@
  */
 
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -406,31 +407,34 @@ int64_t sys_semget(guest_t *g, int32_t key, int nsems, int semflg)
     return id;
 }
 
-/* Largest set this can walk; semctl GETALL fills a caller array. */
-#define SEMOP_MAX_SEMS 1024
+/* Entries a host GETALL can write or a host SETALL can read. The kernel walks
+ * the set's own sem_nsems, an unsigned short in the macOS semid_ds, and not any
+ * count the caller learned earlier: an IPC_STAT answer goes stale the moment
+ * another process removes the set and a larger one takes its id. So every
+ * buffer handed to the host is this size, and the IPC_STAT count only bounds
+ * what crosses to or from the guest.
+ */
+#define SEM_HOST_MAX_NSEMS ((size_t) USHRT_MAX)
+
+static unsigned short *sem_host_vals_alloc(void)
+{
+    return calloc(SEM_HOST_MAX_NSEMS, sizeof(unsigned short));
+}
+
+/* Semaphores in the set per IPC_STAT, or a negative Linux errno. */
+static int sem_stat_nsems(int semid)
+{
+    struct semid_ds info;
+    if (semctl(semid, 0, IPC_STAT, &info) < 0)
+        return (int) linux_errno();
+    if (info.sem_nsems == 0)
+        return -LINUX_EINVAL;
+    return (int) info.sem_nsems;
+}
 
 /* Outcomes of the walk below that are not an operation index. */
 #define SEMOP_BLOCKER_NONE (-1)    /* Every operation could proceed */
 #define SEMOP_BLOCKER_UNKNOWN (-2) /* The values could not be read */
-
-/* Semaphores in the set, or SEMOP_BLOCKER_UNKNOWN.
- *
- * Split from the walk because a set cannot be resized, so this is read once per
- * semop rather than once per retry: the walk runs again on every pass of the
- * polling loop, and re-asking the kernel for a constant on each one is a
- * syscall spent to learn nothing.
- */
-static int semop_read_nsems(int semid)
-{
-    struct semid_ds info;
-    if (semctl(semid, 0, IPC_STAT, &info) < 0)
-        return SEMOP_BLOCKER_UNKNOWN;
-
-    int nsems = (int) info.sem_nsems;
-    if (nsems <= 0 || nsems > SEMOP_MAX_SEMS)
-        return SEMOP_BLOCKER_UNKNOWN;
-    return nsems;
-}
 
 /* Index of the operation that cannot proceed against the current values.
  *
@@ -452,6 +456,8 @@ static int semop_read_nsems(int semid)
  *
  * nsems is resolved once per semop by the caller, since a set cannot be
  * resized. The values are re-read on every pass, because those are what move.
+ * vals is the caller's SEM_HOST_MAX_NSEMS scratch buffer, so a set replaced
+ * under the same id cannot make the host write past it.
  *
  * They can move between this read and the failed semop it explains, so the
  * operation named here can differ from the one the host actually stopped on.
@@ -464,41 +470,57 @@ static int semop_read_nsems(int semid)
 static int semop_first_blocker(int semid,
                                const struct sembuf *sops,
                                unsigned nsops,
-                               int nsems)
+                               int nsems,
+                               unsigned short *vals)
 {
-    unsigned short vals[SEMOP_MAX_SEMS];
     if (nsems <= 0 || semctl(semid, 0, GETALL, vals) < 0)
         return SEMOP_BLOCKER_UNKNOWN;
 
-    /* Widened because a positive operation may carry the running value past
-     * what a semaphore can hold, and the walk only needs the comparisons to
-     * stay honest until it reaches the operation that stops it.
+    /* Running value after each operation, so a later operation on the same
+     * semaphore sees what the earlier ones left. Kept per operation rather than
+     * per semaphore because nsops is at most 256 while a set can hold
+     * SEM_HOST_MAX_NSEMS. Widened because a positive operation may carry the
+     * running value past what a semaphore can hold, and the walk only needs the
+     * comparisons to stay honest until it reaches the operation that stops it.
      */
-    int cur[SEMOP_MAX_SEMS];
-    for (int i = 0; i < nsems; i++)
-        cur[i] = (int) vals[i];
-
+    int after[256];
     for (unsigned i = 0; i < nsops; i++) {
         int num = sops[i].sem_num;
-        if (num < 0 || num >= nsems) {
+        if (num >= nsems) {
             /* Out of range: the host semop owns that error */
             return SEMOP_BLOCKER_UNKNOWN;
         }
 
-        int op = sops[i].sem_op;
-        if (op > 0) {
-            cur[num] += op;
-        } else if (op == 0) {
-            if (cur[num] != 0)
-                return (int) i;
-        } else {
-            if (cur[num] < -op)
-                return (int) i;
-            cur[num] += op;
+        int cur = (int) vals[num];
+        for (unsigned j = i; j-- > 0;) {
+            if (sops[j].sem_num == sops[i].sem_num) {
+                cur = after[j];
+                break;
+            }
         }
+
+        int op = sops[i].sem_op;
+        if (op == 0 && cur != 0)
+            return (int) i;
+        if (op < 0 && cur < -op)
+            return (int) i;
+        after[i] = cur + op;
     }
 
     return SEMOP_BLOCKER_NONE;
+}
+
+/* Linux errno for a failed IPC_NOWAIT probe, from the host errno.
+ *
+ * An object this call has already waited on was valid then, so a stale id now
+ * means IPC_RMID removed it under the wait, which Linux reports as EIDRM. The
+ * host poll cannot tell, since it never sleeps inside the kernel where that
+ * error is raised. Callers pass whether their io_retry_backoff state has left
+ * zero, which is the same as having waited at least once.
+ */
+static int64_t sysv_poll_errno(bool waited)
+{
+    return (waited && errno == EINVAL) ? -LINUX_EIDRM : linux_errno();
 }
 
 int64_t sys_semop(guest_t *g, int semid, uint64_t sops_gva, unsigned nsops)
@@ -533,29 +555,54 @@ int64_t sys_semop(guest_t *g, int semid, uint64_t sops_gva, unsigned nsops)
      * makes, so an all-blocking set pays nothing for it.
      */
     int nsems = 0;
+    unsigned short *vals = NULL;
 
     unsigned backoff = 0;
+    int64_t rc;
     for (;;) {
-        if (semop(semid, poll_sops, nsops) == 0)
-            return 0;
-        if (errno != EAGAIN)
-            return linux_errno();
+        if (semop(semid, poll_sops, nsops) == 0) {
+            rc = 0;
+            break;
+        }
+        if (errno != EAGAIN) {
+            rc = sysv_poll_errno(backoff != 0);
+            break;
+        }
 
         /* The set did not apply. Linux owes EAGAIN only when the operation that
          * stopped it is itself IPC_NOWAIT; when a blocking one stopped it the
          * caller waits, whatever flags the rest of the set carries.
          */
         if (any_nowait) {
+            /* Read once per semop, not per pass: a set cannot be resized. A
+             * negative errno sticks too, and the walk answers it as unknown.
+             */
             if (nsems == 0)
-                nsems = semop_read_nsems(semid);
-            int blocker = semop_first_blocker(semid, sops, nsops, nsems);
-            if (blocker >= 0 && (sops[blocker].sem_flg & IPC_NOWAIT))
-                return -LINUX_EAGAIN;
+                nsems = sem_stat_nsems(semid);
+
+            /* No count, no walk: the blocker probe answers unknown without
+             * touching the buffer, so do not allocate one for it.
+             */
+            if (nsems > 0 && !vals) {
+                vals = sem_host_vals_alloc();
+                if (!vals) {
+                    /* Waiting on would turn an owed EAGAIN into a hang */
+                    rc = -LINUX_ENOMEM;
+                    break;
+                }
+            }
+            int blocker = semop_first_blocker(semid, sops, nsops, nsems, vals);
+            if (blocker >= 0 && (sops[blocker].sem_flg & IPC_NOWAIT)) {
+                rc = -LINUX_EAGAIN;
+                break;
+            }
         }
-        int64_t wait_rc = io_retry_backoff(&backoff);
-        if (wait_rc < 0)
-            return wait_rc;
+        rc = io_retry_backoff(&backoff);
+        if (rc < 0)
+            break;
     }
+    free(vals);
+    return rc;
 }
 
 int64_t sys_semctl(guest_t *g, int semid, int semnum, int cmd, uint64_t arg)
@@ -583,16 +630,12 @@ int64_t sys_semctl(guest_t *g, int semid, int semnum, int cmd, uint64_t arg)
 
     case LINUX_GETALL: {
         /* arg is guest pointer to unsigned short array */
-        struct semid_ds info;
-        if (semctl(semid, 0, IPC_STAT, &info) < 0)
-            return linux_errno();
-
-        int nsems = (int) info.sem_nsems;
-        if (nsems <= 0 || nsems > 1024)
-            return -LINUX_EINVAL;
+        int nsems = sem_stat_nsems(semid);
+        if (nsems < 0)
+            return nsems;
 
         size_t vals_len = (size_t) nsems * sizeof(unsigned short);
-        unsigned short *vals = malloc(vals_len);
+        unsigned short *vals = sem_host_vals_alloc();
         if (!vals)
             return -LINUX_ENOMEM;
         if (semctl(semid, 0, GETALL, vals) < 0) {
@@ -610,16 +653,12 @@ int64_t sys_semctl(guest_t *g, int semid, int semnum, int cmd, uint64_t arg)
     }
 
     case LINUX_SETALL: {
-        struct semid_ds info;
-        if (semctl(semid, 0, IPC_STAT, &info) < 0)
-            return linux_errno();
-
-        int nsems = (int) info.sem_nsems;
-        if (nsems <= 0 || nsems > 1024)
-            return -LINUX_EINVAL;
+        int nsems = sem_stat_nsems(semid);
+        if (nsems < 0)
+            return nsems;
 
         size_t vals_len = (size_t) nsems * sizeof(unsigned short);
-        unsigned short *vals = malloc(vals_len);
+        unsigned short *vals = sem_host_vals_alloc();
         if (!vals)
             return -LINUX_ENOMEM;
         if (guest_read(g, arg, vals, vals_len) < 0) {
@@ -735,14 +774,25 @@ int64_t sys_msgsnd(guest_t *g,
     }
 
     /* The mtype field is a 64-bit long on aarch64-linux. macOS also uses long
-     * (64-bit on arm64). Direct passthrough.
+     * (64-bit on arm64). Direct passthrough. Polls like sys_semop, for the same
+     * reason: a host msgsnd blocked on a full queue parks the vCPU thread where
+     * no teardown or signal wake reaches it. A refused IPC_NOWAIT send queues
+     * nothing, so the retry is the whole of the wait.
      */
-    int flags = 0;
-    if (msgflg & LINUX_IPC_NOWAIT)
-        flags |= IPC_NOWAIT;
-
-    result =
-        (msgsnd(msqid, buf, (size_t) msgsz, flags) < 0) ? linux_errno() : 0;
+    unsigned backoff = 0;
+    for (;;) {
+        if (msgsnd(msqid, buf, (size_t) msgsz, IPC_NOWAIT) == 0) {
+            result = 0;
+            break;
+        }
+        if (errno != EAGAIN || (msgflg & LINUX_IPC_NOWAIT)) {
+            result = sysv_poll_errno(backoff != 0);
+            break;
+        }
+        result = io_retry_backoff(&backoff);
+        if (result < 0)
+            break;
+    }
 out:
     free(heap);
     return result;
@@ -764,9 +814,10 @@ int64_t sys_msgrcv(guest_t *g,
     if (msgflg & (LINUX_MSG_COPY | LINUX_MSG_EXCEPT))
         return -LINUX_ENOSYS;
 
-    int flags = 0;
-    if (msgflg & LINUX_IPC_NOWAIT)
-        flags |= IPC_NOWAIT;
+    /* Every receive is an IPC_NOWAIT probe; the guest's own flag only decides
+     * whether an empty queue is answered with ENOMSG or waited on below.
+     */
+    int flags = IPC_NOWAIT;
     if (msgflg & LINUX_MSG_NOERROR)
         flags |= MSG_NOERROR;
 
@@ -781,11 +832,19 @@ int64_t sys_msgrcv(guest_t *g,
         buf = heap;
     }
 
+    /* Polls like sys_msgsnd. A failed probe dequeues nothing. */
     int64_t result;
-    ssize_t ret = msgrcv(msqid, buf, (size_t) msgsz, (long) msgtyp, flags);
-    if (ret < 0) {
-        result = linux_errno();
-        goto out;
+    ssize_t ret;
+    unsigned backoff = 0;
+    while ((ret = msgrcv(msqid, buf, (size_t) msgsz, (long) msgtyp, flags)) <
+           0) {
+        if (errno != ENOMSG || (msgflg & LINUX_IPC_NOWAIT)) {
+            result = sysv_poll_errno(backoff != 0);
+            goto out;
+        }
+        result = io_retry_backoff(&backoff);
+        if (result < 0)
+            goto out;
     }
 
     /* Write back mtype + received bytes to guest */

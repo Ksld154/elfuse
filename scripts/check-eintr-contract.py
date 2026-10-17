@@ -288,6 +288,18 @@ INVENTORY = {
         "A failed IPC_NOWAIT probe applies none of the semaphore operations "
         "before the backoff waits.",
     ),
+    "syscall/sysvipc.c::sys_msgsnd": (
+        "restartable",
+        "A refused IPC_NOWAIT send queues nothing before the backoff waits. "
+        "Linux answers ERESTARTNOHAND, so a handler sees EINTR whatever its "
+        "SA_RESTART, and only a wake that ran no handler restarts, which is "
+        "the leader-handoff case the dispatcher restarts here.",
+    ),
+    "syscall/sysvipc.c::sys_msgrcv": (
+        "restartable",
+        "A failed IPC_NOWAIT receive dequeues nothing before the backoff "
+        "waits. Restart semantics match sys_msgsnd (ERESTARTNOHAND).",
+    ),
     "syscall/netlink.c::nl_wait_readable_locked": (
         "forbids",
         "Conditionally, and that condition is sock_intr_errno()'s: a receive "

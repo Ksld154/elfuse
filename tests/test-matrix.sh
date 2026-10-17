@@ -969,6 +969,8 @@ run_unit_tests()
 
     printf "\nSysV shared memory\n"
     test_rc "$runner" "test-sysv-shm" 0 "$bindir/test-sysv-shm"
+    test_rc "$runner" "test-sysv-sem" 0 "$bindir/test-sysv-sem"
+    test_rc "$runner" "test-sysv-msg-wait" 0 "$bindir/test-sysv-msg-wait"
 
     printf "\nCredential/identity emulation\n"
     test_rc "$runner" "test-credentials" 0 "$bindir/test-credentials"
