@@ -573,10 +573,10 @@ int elf_load_fd(int fd, const char *display_path, elf_info_t *info)
     elf_sort_segments(info->segments, seg_count);
 
     /* Reject PT_LOADs that claim the same bytes: finalize_block_perms unions
-     * the permissions of every region covering a page, so the shared pages
-     * would carry both segments' PF_ bits. Byte granularity, not page: two
-     * segments merely sharing a page after rounding are legal and Linux runs
-     * them.
+     * the permissions of overlapping regions, so those bytes would carry both
+     * segments' PF_ bits. Byte granularity, not page: two segments merely
+     * sharing a page after rounding are legal, Linux runs them, and the page
+     * goes to the later segment.
      */
     int bad = elf_first_overlap(info->segments, seg_count);
     if (bad > 0) {

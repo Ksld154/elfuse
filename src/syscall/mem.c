@@ -24,6 +24,8 @@
 #include "debug/log.h"
 #include "utils.h"
 
+#include "core/vdso.h"
+
 #include "proved/align.h"
 #include "proved/brk.h"
 
@@ -3670,6 +3672,14 @@ int64_t sys_mremap(guest_t *g,
      */
     if (guest_range_hits_infra(g, old_off, old_off + old_size))
         return -LINUX_EINVAL;
+
+    /* Signal delivery returns every handler through the trampoline at
+     * VDSO_BASE, so the vDSO cannot move. Linux lets it move and follows it
+     * (mm->context.vdso); refusing keeps the EFAULT an untracked vDSO page gave
+     * before [vdso] had a region.
+     */
+    if (old_off < VDSO_BASE + VDSO_SIZE && old_off + old_size > VDSO_BASE)
+        return -LINUX_EFAULT;
 
     /* Verify the whole source range is covered by one logical VMA. A fork-aware
      * growth can split that VMA at the inherited/private boundary, but no

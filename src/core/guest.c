@@ -2131,6 +2131,24 @@ int guest_region_add_ex_gpa(guest_t *g,
                                          0);
 }
 
+int guest_region_add_elf_segment(guest_t *g,
+                                 uint64_t start,
+                                 uint64_t end,
+                                 uint64_t gpa_base,
+                                 int prot,
+                                 uint64_t offset,
+                                 const char *name)
+{
+    uint64_t lead = start & (GUEST_PAGE_SIZE - 1);
+    start -= lead;
+    end = PAGE_ALIGN_UP(end);
+    if (guest_region_remove(g, start, end) < 0)
+        return -1;
+    return guest_region_add_ex_gpa(
+        g, start, end, gpa_base - lead, prot, LINUX_MAP_PRIVATE,
+        offset >= lead ? offset - lead : 0, name, -1);
+}
+
 /* next_vma_id is a high-water mark over every live vma_id: IDs originate here,
  * an explicit ID passed to guest_region_add_ex_owned_gpa raises the mark, and
  * fork restore reseeds it to the restored maximum. No live region can hold the
@@ -2748,9 +2766,7 @@ static bool finalize_block_perms(guest_t *g, const mem_region_t *regions, int n)
                 continue;
 
             /* Split into L3 pages, invalidate the lot, then rebuild the block
-             * from per-page unions. This preserves the required permission
-             * union when adjacent ELF segments share a 4KiB page after
-             * page-granularity rounding.
+             * from per-page unions of the regions covering each page.
              */
             if (guest_split_block(g, b) < 0)
                 return false;
@@ -2765,13 +2781,23 @@ static bool finalize_block_perms(guest_t *g, const mem_region_t *regions, int n)
                 uint64_t apply_end =
                     (s_end < b + BLOCK_2MIB) ? s_end : b + BLOCK_2MIB;
 
-                /* Page-align to 4KiB so partially covered pages are recreated
-                 * with the union of all overlapping segment permissions.
-                 */
                 apply_start = ALIGN_DOWN(apply_start, PAGE_SIZE);
                 apply_end = PAGE_ALIGN_UP(apply_end);
                 if (apply_end > b + BLOCK_2MIB)
                     apply_end = b + BLOCK_2MIB;
+
+                /* A page that two ELF segments share goes to the later one,
+                 * which Linux elf_map maps over the earlier one, so this region
+                 * leaves its last page to a region that starts on it. The
+                 * region tracker records the page the same way
+                 * (guest_region_add_elf_segment).
+                 */
+                for (int j = 0; j < nidx; j++) {
+                    uint64_t next = regions[idx[j]].gpa_start;
+                    if (next >= s_end && next < PAGE_ALIGN_UP(s_end) &&
+                        apply_end > ALIGN_DOWN(s_end, PAGE_SIZE))
+                        apply_end = ALIGN_DOWN(s_end, PAGE_SIZE);
+                }
 
                 for (uint64_t pa = apply_start; pa < apply_end;
                      pa += PAGE_SIZE) {
