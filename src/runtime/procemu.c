@@ -2806,9 +2806,6 @@ static int intercept_open_dispatch(const guest_t *g,
 
         /* vsize and rss cover the regions VmSize and VmRSS count. */
         uint64_t vsize = 0, rss_pages = 0;
-        long page_size = sysconf(_SC_PAGESIZE);
-        if (page_size <= 0)
-            page_size = 4096;
         for (int i = 0; i < g->nregions; i++) {
             const guest_region_t *r = &g->regions[i];
             if (!guest_region_in_process_vm(g, r))
@@ -2816,7 +2813,7 @@ static int intercept_open_dispatch(const guest_t *g,
             uint64_t sz = r->end - r->start;
             vsize += sz;
             if (r->prot != LINUX_PROT_NONE) /* non-PROT_NONE = resident */
-                rss_pages += sz / (uint64_t) page_size;
+                rss_pages += sz / GUEST_PAGE_SIZE;
         }
 
         uint64_t start_stack = proc_start_stack(g);
