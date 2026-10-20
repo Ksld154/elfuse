@@ -21,10 +21,10 @@ PROC_LIMITS="${3:?Usage: $0 <elfuse-binary> <busybox-binary> <test-proc-limits>}
 # shellcheck source=tests/lib/report.sh
 . "$(dirname "$0")/lib/report.sh"
 
-# 1.5 TiB in KiB. At 1 TiB the first 1 TiB guest slab no longer fits beside
-# elfuse and boot falls back to a smaller one, and a power of two would clamp
+# 6 TiB in KiB: finite, far above the address space elfuse takes for its 1 TiB
+# guest slab and the rest of its boot, and not a power of two, which would clamp
 # RLIMIT_AS onto a value test-proc-limits gives another limit.
-AS_KIB=1610612736
+AS_KIB=6442450944
 
 # row <ulimit-args> <row-name>: print the soft and hard columns of the guest row
 # after running ulimit with <ulimit-args> (none for the host defaults).
@@ -40,7 +40,7 @@ row()
 expect_row()
 {
     local got
-    got="$(row "$2" "$3")"
+    got="$(row "$2" "$3")" || got="exit $?"
     if [ "$got" = "$4" ]; then
         report_pass "$1"
     else
@@ -64,7 +64,7 @@ expect_row "a lowered hard stack limit passes through" "-s 4096" \
     "Max stack size" "4194304 4194304"
 
 if bash -c "ulimit -v $AS_KIB && exec \"\$0\" \"\$1\"" \
-    "$ELFUSE" "$PROC_LIMITS" > /dev/null 2>&1; then
+    "$ELFUSE" "$PROC_LIMITS" > /dev/null; then
     report_pass "test-proc-limits under a host AS limit"
 else
     report_fail "test-proc-limits under a host AS limit"
