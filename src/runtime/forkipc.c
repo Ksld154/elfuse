@@ -759,7 +759,8 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
         resolve_clone_stack_range(g, child_stack, &stack_map_start,
                                   &stack_map_end);
 
-    thread_entry_t *t = thread_alloc(child_tid, stack_map_start, stack_map_end);
+    thread_entry_t *t =
+        thread_alloc(child_tid, stack_map_start, stack_map_end, NULL);
     if (!t) {
         log_error("clone_thread: thread table full");
         return -LINUX_EAGAIN;
@@ -1184,19 +1185,20 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
         resolve_clone_stack_range(g, child_stack, &stack_map_start,
                                   &stack_map_end);
 
-    thread_entry_t *t = thread_alloc(child_tid, stack_map_start, stack_map_end);
+    /* Waitable via wait4, unlike a CLONE_THREAD thread. The low byte of the
+     * flags is the exit signal.
+     */
+    thread_vm_clone_t vm_clone = {
+        .parent_tid = current_thread ? thread_tid(current_thread) : 0,
+        .exit_signal = (flags & 0xFF) ? (int) (flags & 0xFF) : LINUX_SIGCHLD,
+    };
+    thread_entry_t *t =
+        thread_alloc(child_tid, stack_map_start, stack_map_end, &vm_clone);
     if (!t) {
         log_error("clone_vm: thread table full");
         return -LINUX_EAGAIN;
     }
     uint64_t t_generation = t->generation;
-
-    /* Mark as VM-clone child (waitable via wait4, not CLONE_THREAD) */
-    t->is_vm_clone = true;
-    t->parent_tid = current_thread ? thread_tid(current_thread) : 0;
-    t->exit_signal = (int) (flags & 0xFF); /* Low byte = exit signal */
-    if (t->exit_signal == 0)
-        t->exit_signal = LINUX_SIGCHLD;
 
     /* Inherit parent's signal mask */
     if (current_thread)

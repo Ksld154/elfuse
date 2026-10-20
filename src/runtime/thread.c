@@ -233,7 +233,8 @@ static void thread_slot_clear(thread_entry_t *t)
 
 thread_entry_t *thread_alloc(int64_t tid,
                              uint64_t stack_start,
-                             uint64_t stack_end)
+                             uint64_t stack_end,
+                             const thread_vm_clone_t *vm_clone)
 {
     thread_entry_t *result = NULL;
 
@@ -292,6 +293,15 @@ rescan:
         }
         t->altstack_flags = LINUX_SS_DISABLE;
         thread_ptrace_init(t);
+
+        /* Set with the rest of the slot, so a reader that holds thread_lock
+         * never finds this child active and taken for a thread.
+         */
+        if (vm_clone) {
+            t->is_vm_clone = true;
+            t->parent_tid = vm_clone->parent_tid;
+            t->exit_signal = vm_clone->exit_signal;
+        }
 
         /* Release-store last so a lock-free scanner that observes active == 1
          * also sees the zeroed tpending / guest_tid set above.

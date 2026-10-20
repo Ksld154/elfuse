@@ -297,13 +297,21 @@ void thread_register_main(hv_vcpu_t vcpu,
                           int64_t tid,
                           uint64_t sp_el1);
 
-/* Allocate a new thread table slot for the given TID.
+/* What a clone(CLONE_VM) child without CLONE_THREAD records about itself. */
+typedef struct {
+    int64_t parent_tid;
+    int exit_signal;
+} thread_vm_clone_t;
+
+/* Allocate a new thread table slot for the given TID, a VM-clone child when
+ * @vm_clone is set and a thread of the caller's group when it is NULL.
  * Returns a pointer to the entry, or NULL if the table is full. The caller must
  * fill in vcpu, vexit, host_thread, sp_el1.
  */
 thread_entry_t *thread_alloc(int64_t tid,
                              uint64_t stack_start,
-                             uint64_t stack_end);
+                             uint64_t stack_end,
+                             const thread_vm_clone_t *vm_clone);
 
 /* Mark a thread as inactive and release its table slot. */
 void thread_deactivate(thread_entry_t *t);
