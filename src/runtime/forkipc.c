@@ -1318,6 +1318,7 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
  */
 static void vm_clone_report_bringup_failure(thread_entry_t *t)
 {
+    int64_t child_tid = thread_tid(t);
     pthread_mutex_t *lock = thread_get_lock();
     pthread_mutex_lock(lock);
     thread_destroy_own_vcpu_locked(t);
@@ -1331,6 +1332,7 @@ static void vm_clone_report_bringup_failure(thread_entry_t *t)
     thread_fork_release_counted_locked(t);
     pthread_cond_broadcast(&t->ptrace_cond);
     pthread_mutex_unlock(lock);
+    proc_pidfd_notify_exit(child_tid);
 }
 
 /* Worker entry for vm-clone children. Sets up vCPU, runs guest code, then marks
@@ -1450,12 +1452,10 @@ static void *vm_clone_thread_run(void *arg)
      * first. The slot only becomes reapable (vm_exited) once the handle is
      * gone, so a parent wait4 that reaps and deactivates the slot can never
      * leave a later teardown scan racing an undestroyed vCPU. thread_lock also
-     * serializes this against thread_destroy_all_vcpus. Destroying this vCPU
-     * ahead of thread_interrupt_all below is fine: the current vCPU already
-     * left hv_vcpu_run, and thread_interrupt_all only needs the OTHER vCPUs'
-     * handles. vm_exit_status is wait-format: (exit_code << 8) for a normal
-     * exit.
+     * serializes this against thread_destroy_all_vcpus. vm_exit_status is
+     * wait-format: (exit_code << 8) for a normal exit.
      */
+    int64_t child_tid = thread_tid(t);
     pthread_mutex_t *lock = thread_get_lock();
     pthread_mutex_lock(lock);
     thread_destroy_own_vcpu_locked(t);
@@ -1463,27 +1463,11 @@ static void *vm_clone_thread_run(void *arg)
     t->vm_exit_status = wait_status;
     pthread_cond_broadcast(&t->ptrace_cond);
     pthread_mutex_unlock(lock);
+    proc_pidfd_notify_exit(child_tid);
 
     /* Slot stays active until the parent collects status with wait4;
      * thread_ptrace_wait frees it when it reads vm_exited.
      */
-
-    /* Last VM-clone child triggers exit_group so the main thread's futex_wait /
-     * run loop unblocks (mirrors SIGCHLD on child exit). vm_exited is already
-     * set, so this slot excludes itself from the active-clone count.
-     */
-    int last_clone = (thread_count_active_vm_clones() == 0);
-    if (last_clone) {
-        log_debug("last vm_clone exited, triggering exit_group");
-        proc_request_exit_group(exit_code);
-
-        /* thread_interrupt_all only reaches threads inside hv_vcpu_run; peers
-         * parked on fork_cond or another slot's ptrace_cond/resume_cond need
-         * the separate broadcast.
-         */
-        thread_interrupt_all();
-        thread_wake_exit_waiters();
-    }
 
     return NULL;
 }

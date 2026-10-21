@@ -733,7 +733,7 @@ run_unit_tests()
     test_check "$runner" "test-cloexec" "PASS" "$bindir/test-cloexec"
     test_rc "$runner" "test-exec-limits" 0 "$bindir/test-exec-limits"
     test_rc "$runner" "test-session" 0 "$bindir/test-session"
-    test_rc "$runner" "test-pidfd" 0 "$bindir/test-pidfd"
+    test_check "$runner" "test-pidfd" "0 failed" "$bindir/test-pidfd"
     test_check "$runner" "test-pidfd-dup" "0 failed" "$bindir/test-pidfd-dup"
     test_check "$runner" "test-pidfd-fork" "0 failed" "$bindir/test-pidfd-fork"
 

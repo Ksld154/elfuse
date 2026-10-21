@@ -9,6 +9,7 @@
  */
 
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -34,6 +35,7 @@
 #define SIGCHLD 17
 
 int passes = 0, fails = 0;
+static _Atomic int vm_exit_gate;
 
 /* Linux clone3 args */
 struct clone_args {
@@ -199,10 +201,7 @@ int main(void)
         raw_syscall4(__NR_wait4, child, 0, 0, 0);
     }
 
-    /* clone3(CLONE_PIDFD | CLONE_VM): the child runs inside this process and so
-     * has a guest tid but no host pid of its own. Nothing outside can watch it,
-     * but it has not exited either, so its pidfd must stay unreadable while it
-     * runs rather than report an exit that never happened.
+    /* A CLONE_VM child's pidfd becomes readable only after the child exits.
      *
      * This case cannot be cross-checked against a real kernel: a CLONE_VM child
      * resumes on the fresh stack below, where the compiler's copy of the clone3
@@ -217,7 +216,6 @@ int main(void)
             FAIL("mmap for stack failed");
             goto done;
         }
-
         int32_t vm_pidfd = -1;
         struct clone_args ca = {0};
         ca.flags = CLONE_PIDFD | CLONE_VM;
@@ -228,13 +226,16 @@ int main(void)
 
         long child = raw_syscall2(__NR_clone3, (long) &ca, sizeof(ca));
         if (child == 0) {
-            for (;;) {
-                uint64_t ts[2] = {5, 0};
-                raw_syscall2(__NR_nanosleep, (long) ts, 0);
+            while (!atomic_load_explicit(&vm_exit_gate, memory_order_acquire)) {
+                uint64_t delay[2] = {0, 1000000};
+                raw_syscall2(__NR_nanosleep, (long) delay, 0);
             }
+            raw_syscall1(__NR_exit, 42);
+            __builtin_unreachable();
         }
         if (child < 0) {
             FAIL("clone3 CLONE_VM failed");
+            munmap(stack, 65536);
             goto done;
         }
 
@@ -252,7 +253,21 @@ int main(void)
         EXPECT_TRUE(pr == 0 && pf.revents == 0,
                     "pidfd reports an exit while the CLONE_VM child runs");
 
+        atomic_store_explicit(&vm_exit_gate, 1, memory_order_release);
+        ts[0] = 2;
+        ts[1] = 0;
+        TEST("CLONE_VM pidfd becomes readable after child exit");
+        pr = raw_syscall5(__NR_ppoll, (long) &pf, 1, (long) ts, 0, 0);
+        EXPECT_TRUE(pr > 0 && (pf.revents & 1),
+                    "pidfd not readable after CLONE_VM child exit");
+        TEST("CLONE_VM child can be reaped after pidfd notification");
+        int status = 0;
+        EXPECT_EQ(raw_syscall4(__NR_wait4, child, (long) &status, 0, 0), child,
+                  "wait4 did not reap the CLONE_VM child");
+        TEST("CLONE_VM child exit status leaves the parent running");
+        EXPECT_EQ(status, 42 << 8, "wrong CLONE_VM child exit status");
         raw_syscall1(__NR_close, vm_pidfd);
+        munmap(stack, 65536);
     }
 
 done:

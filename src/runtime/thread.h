@@ -415,9 +415,7 @@ void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx);
  */
 bool thread_ptrace_interrupt_pending_locked(void);
 
-/* Count active VM-clone threads (is_vm_clone && !vm_exited). Used to detect
- * when the last VM-clone child exits.
- */
+/* Count running VM-clone children for exec teardown checks. */
 int thread_count_active_vm_clones(void);
 
 /* Join worker threads (all active threads except the caller, minus any already
