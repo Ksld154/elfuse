@@ -97,7 +97,7 @@ static void test_empty_table_drained(void)
 static void test_bringup_worker_is_live(void)
 {
     thread_init();
-    thread_entry_t *w = thread_alloc(1000, 0, 0);
+    thread_entry_t *w = thread_alloc(1000, 0, 0, NULL);
     CHECK(w != NULL);
     if (!w)
         return;
@@ -119,7 +119,7 @@ static void test_bringup_worker_is_live(void)
 static void test_published_worker_not_cross_destroyed(void)
 {
     thread_init();
-    thread_entry_t *w = thread_alloc(1001, 0, 0);
+    thread_entry_t *w = thread_alloc(1001, 0, 0, NULL);
     CHECK(w != NULL);
     if (!w)
         return;
@@ -145,7 +145,7 @@ static void test_published_worker_not_cross_destroyed(void)
 static void test_exited_vmclone_worker_not_live(void)
 {
     thread_init();
-    thread_entry_t *w = thread_alloc(1002, 0, 0);
+    thread_entry_t *w = thread_alloc(1002, 0, 0, NULL);
     CHECK(w != NULL);
     if (!w)
         return;

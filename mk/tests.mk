@@ -24,7 +24,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-dynamic-array-host test-string-builder-host test-gdbstub-host \
         test-config test-runner \
         test-mremap-tail-emfile \
-        test-proctitle-host test-proctitle-low-stack \
+        test-proctitle-host test-proctitle-low-stack test-rlimit-seed \
         test-sysroot-procfs-exec test-sysroot-fd-magiclink \
         test-timeout-disable test-launch-flags \
         test-fuse-alpine \
@@ -251,7 +251,8 @@ endef
 CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-tlbi-encoder-host test-fork-ipc-protocol-host \
         test-vcpu-run-hooks-host test-identity-override-host \
-        test-teardown-live-vcpu-host test-stdio-nonblock-host test-casefold-host \
+        test-teardown-live-vcpu-host test-stdio-nonblock-host \
+        test-rlimit-unchanged-host test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
         test-dynamic-array-host test-string-builder-host \
         test-wakeup-pipe-host test-guest-env-host \
@@ -275,6 +276,7 @@ $(call run-host-unit,test-dynamic-array-host,dynamic array unit test)
 $(call run-host-unit,test-string-builder-host,string builder unit test)
 $(call run-host-unit,test-wakeup-pipe-host,wakeup pipe concurrency unit test)
 $(call run-host-unit,test-stdio-nonblock-host,launcher stdio flags across a guest)
+$(call run-host-unit,test-rlimit-unchanged-host,host rlimits across a guest)
 $(call run-host-unit,test-guest-env-host,guest environment merge cross product)
 $(call run-host-unit,test-usb-desc-host,USB descriptor blob walk unit test)
 $(call run-host-unit,test-usbdev-urb-host,usbdevfs URB bookkeeping unit test)
@@ -327,6 +329,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	$(call run-lane,test-gva-contracts,proved/gva.h call-site contract checks)
 	$(call run-lane,test-proctitle-host,proctitle argv-tail regression)
 	$(call run-lane,test-proctitle-low-stack,proctitle low-stack regression)
+	$(call run-lane,test-rlimit-seed,guest rlimits seeded from host limits)
 	$(call run-lane,test-busybox,busybox applet validation)
 	$(call run-lane,test-sysroot-procfs-exec,sysroot procfs exec validation)
 	$(call run-lane,test-sysroot-fd-magiclink,fd magic link resolution)
@@ -1487,6 +1490,15 @@ test-proctitle-low-stack: $(ELFUSE_BIN) $(BUSYBOX_DEPS)
 		exit 1; \
 	fi
 	@bash tests/test-proctitle-low-stack.sh $(ELFUSE_BIN) $(BUSYBOX_BIN)
+
+## Check guest rlimits seeded from host limits a shell set
+test-rlimit-seed: $(ELFUSE_BIN) $(BUSYBOX_DEPS) $(TEST_DIR)/test-proc-limits
+	@if [ ! -x "$(BUSYBOX_BIN)" ]; then \
+		printf "$(RED)✗ Busybox not found.$(RESET) Set BUSYBOX_BIN=/path/to/busybox.\n"; \
+		exit 1; \
+	fi
+	@bash tests/test-rlimit-seed.sh $(ELFUSE_BIN) $(BUSYBOX_BIN) \
+		$(TEST_DIR)/test-proc-limits
 
 # Static binary integration tests
 ifdef GUEST_STATIC_BINS

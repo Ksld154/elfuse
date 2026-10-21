@@ -152,10 +152,8 @@ int fork_child_main(int ipc_fd,
         log_error("fork-child: bad magic 0x%x", hdr.magic);
         return 1;
     }
-    if (hdr.nofile_cur > hdr.nofile_max || hdr.nofile_max > FD_TABLE_SIZE) {
-        log_error("fork-child: invalid RLIMIT_NOFILE %llu/%llu",
-                  (unsigned long long) hdr.nofile_cur,
-                  (unsigned long long) hdr.nofile_max);
+    if (!sys_rlimit_table_valid(hdr.rlimits)) {
+        log_error("fork-child: invalid rlimit table");
         return 1;
     }
     log_debug("fork-child: pid=%lld ppid=%lld", (long long) hdr.child_pid,
@@ -313,13 +311,9 @@ int fork_child_main(int ipc_fd,
 
     /* Linux preserves already-open descriptors above a newly lowered soft limit
      * across fork. Install the inherited table under the default table limit
-     * first, then restore the parent's guest-visible limit.
+     * first, then restore the parent's guest-visible limits.
      */
-    if (sys_nofile_restore(hdr.nofile_cur, hdr.nofile_max) < 0) {
-        log_error("fork-child: failed to restore RLIMIT_NOFILE");
-        launch_destroy_guest(&g);
-        return 1;
-    }
+    sys_rlimit_restore(hdr.rlimits);
 
     /* Must follow fork_ipc_recv_fd_table: the keepalive recv resolves each
      * payload guest_fd to its (now installed) child-side host master fd.
@@ -759,7 +753,8 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
         resolve_clone_stack_range(g, child_stack, &stack_map_start,
                                   &stack_map_end);
 
-    thread_entry_t *t = thread_alloc(child_tid, stack_map_start, stack_map_end);
+    thread_entry_t *t =
+        thread_alloc(child_tid, stack_map_start, stack_map_end, NULL);
     if (!t) {
         log_error("clone_thread: thread table full");
         return -LINUX_EAGAIN;
@@ -1184,19 +1179,20 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
         resolve_clone_stack_range(g, child_stack, &stack_map_start,
                                   &stack_map_end);
 
-    thread_entry_t *t = thread_alloc(child_tid, stack_map_start, stack_map_end);
+    /* Waitable via wait4, unlike a CLONE_THREAD thread. The low byte of the
+     * flags is the exit signal.
+     */
+    thread_vm_clone_t vm_clone = {
+        .parent_tid = current_thread ? thread_tid(current_thread) : 0,
+        .exit_signal = (flags & 0xFF) ? (int) (flags & 0xFF) : LINUX_SIGCHLD,
+    };
+    thread_entry_t *t =
+        thread_alloc(child_tid, stack_map_start, stack_map_end, &vm_clone);
     if (!t) {
         log_error("clone_vm: thread table full");
         return -LINUX_EAGAIN;
     }
     uint64_t t_generation = t->generation;
-
-    /* Mark as VM-clone child (waitable via wait4, not CLONE_THREAD) */
-    t->is_vm_clone = true;
-    t->parent_tid = current_thread ? thread_tid(current_thread) : 0;
-    t->exit_signal = (int) (flags & 0xFF); /* Low byte = exit signal */
-    if (t->exit_signal == 0)
-        t->exit_signal = LINUX_SIGCHLD;
 
     /* Inherit parent's signal mask */
     if (current_thread)
@@ -1873,9 +1869,6 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      * but before sibling vCPUs resume. Declared up front so all goto paths to
      * fail_snapshot can free it unconditionally. Header
      */
-    uint64_t nofile_cur, nofile_max;
-    sys_nofile_snapshot(&nofile_cur, &nofile_max);
-
     ipc_header_t hdr = {
         .magic = IPC_MAGIC_HEADER,
         .ipa_bits = g->ipa_bits,
@@ -1916,9 +1909,8 @@ int64_t sys_clone(hv_vcpu_t vcpu,
             flags & (LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID),
         .ctid_gva = ctid_gva,
         .shm_is_clone = (snapshot_shm_fd >= 0) ? 1 : 0,
-        .nofile_cur = nofile_cur,
-        .nofile_max = nofile_max,
     };
+    sys_rlimit_snapshot(hdr.rlimits);
     proc_registry_publish_self();
     if (fork_ipc_write_all(ipc_sock, &hdr, sizeof(hdr)) < 0) {
         log_error("clone: failed to send header");
