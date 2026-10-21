@@ -142,6 +142,68 @@ static void test_create(void)
     timer_delete(timer);
 }
 
+static void test_settime_flags(void)
+{
+    struct sigevent event = {.sigev_notify = SIGEV_NONE};
+    int id;
+    require(syscall(SYS_timer_create, CLOCK_MONOTONIC, &event, &id) == 0,
+            "create silent timer");
+    for (int absolute = 0; absolute < 2; absolute++) {
+        struct itimerspec value = {.it_value.tv_sec = 60}, remaining;
+        if (absolute) {
+            require(clock_gettime(CLOCK_MONOTONIC, &value.it_value) == 0,
+                    "clock_gettime");
+            value.it_value.tv_sec += 60;
+        }
+        int flags = (int) UINT32_C(0x80000006) | (absolute ? TIMER_ABSTIME : 0);
+        TEST("settime ignores unknown flags and honors TIMER_ABSTIME");
+        EXPECT_TRUE(syscall(SYS_timer_settime, id, flags, &value, NULL) == 0 &&
+                        syscall(SYS_timer_gettime, id, &remaining) == 0 &&
+                        remaining.it_value.tv_sec >= 55 &&
+                        remaining.it_value.tv_sec <= 60,
+                    "unknown flags changed the deadline or caused an error");
+        value.it_value.tv_nsec = 1000000000;
+        TEST("unknown flags do not bypass timespec validation");
+        EXPECT_ERRNO(syscall(SYS_timer_settime, id, flags, &value, NULL),
+                     EINVAL, "invalid timespec accepted");
+    }
+    require(syscall(SYS_timer_delete, id) == 0, "delete silent timer");
+}
+
+static void test_reuse(void)
+{
+    struct sigevent event = {.sigev_notify = SIGEV_NONE};
+    int ids[64];
+    int valid = 1;
+    for (unsigned i = 0; i < 64; i++) {
+        require(
+            syscall(SYS_timer_create, CLOCK_MONOTONIC, &event, &ids[i]) == 0,
+            "fill timer slots");
+        for (unsigned j = 0; j < i; j++)
+            valid &= ids[i] != ids[j];
+    }
+    int extra;
+    TEST("a full timer table reports EAGAIN");
+    EXPECT_ERRNO(syscall(SYS_timer_create, CLOCK_MONOTONIC, &event, &extra),
+                 EAGAIN, "full table accepted a timer");
+    for (unsigned i = 0; i < 64; i += 2) {
+        require(syscall(SYS_timer_delete, ids[i]) == 0, "delete timer");
+        require(
+            syscall(SYS_timer_create, CLOCK_MONOTONIC, &event, &ids[i]) == 0,
+            "reuse timer slot");
+    }
+    for (unsigned i = 0; i < 64; i++) {
+        struct itimerspec value;
+        valid &= ids[i] >= 0 && syscall(SYS_timer_gettime, ids[i], &value) == 0;
+        for (unsigned j = 0; j < i; j++)
+            valid &= ids[i] != ids[j];
+    }
+    TEST("reused slots keep all live timer IDs distinct and usable");
+    EXPECT_TRUE(valid, "timer IDs alias or no longer refer to a live timer");
+    for (unsigned i = 0; i < 64; i++)
+        require(syscall(SYS_timer_delete, ids[i]) == 0, "delete timer");
+}
+
 static void test_notifications(int signum, int use_fd, int periodic)
 {
     int count = signum == SIGUSR1 ? 2 : 33;
@@ -321,6 +383,7 @@ int main(int argc, char **argv)
         return !ok;
     }
     if (argc > 1 && strcmp(argv[1], "elfuse") == 0) {
+        test_reuse();
         /* Older Linux kernels keep a queued signal after delete or rearm. */
         for (int rearm = 0; rearm < 2; rearm++) {
             test_cleanup(SIGUSR1, rearm);
@@ -341,6 +404,7 @@ int main(int argc, char **argv)
                      ENOSYS, "unsupported notification misreported");
     } else {
         test_create();
+        test_settime_flags();
         for (int periodic = 0; periodic < 2; periodic++) {
             for (int use_fd = 0; use_fd < 2; use_fd++) {
                 test_notifications(SIGUSR1, use_fd, periodic);

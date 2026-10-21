@@ -276,8 +276,6 @@ typedef struct {
  */
 static guest_posix_timer_t posix_timers[POSIX_TIMER_MAX];
 
-/* Keep IDs unique so a deleted timer's queued signal cannot name a new timer.
- */
 static int posix_next_id;
 static int posix_timer_next_slot[LINUX_NSIG];
 static _Atomic bool posix_timers_need_poll;
@@ -521,7 +519,8 @@ static void posix_timer_discard_pending_locked(signal_pending_t *p, int id)
                 pending_clear(&p->pending, sig_bit(signum));
             }
         }
-        if (p == &sig_state.shared)
+        if (p == &sig_state.shared &&
+            !(pending_load(&p->pending) & sig_bit(signum)))
             shared_claim_release_locked(signum);
     }
 }
@@ -1662,10 +1661,13 @@ int signal_posix_timer_create(int clockid,
         return -LINUX_EINVAL;
     int ret = -LINUX_EAGAIN;
     pthread_mutex_lock(&sig_lock);
-    for (int i = 0; i < POSIX_TIMER_MAX && posix_next_id < INT32_MAX; i++) {
+    for (int i = 0; i < POSIX_TIMER_MAX; i++) {
         if (posix_timers[i].used)
             continue;
-        ret = posix_next_id++;
+        do {
+            ret = posix_next_id;
+            posix_next_id = ret == INT32_MAX ? 0 : ret + 1;
+        } while (posix_timer_find_locked(ret));
         posix_timers[i] = (guest_posix_timer_t) {
             .id = ret,
             .guest_clockid = clockid,

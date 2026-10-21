@@ -149,8 +149,7 @@ int64_t sys_timer_settime(guest_t *g,
     linux_itimerspec_t value, old;
     if (guest_read(g, value_gva, &value, sizeof(value)) < 0)
         return -LINUX_EFAULT;
-    if ((flags & ~LINUX_TIMER_ABSTIME) ||
-        !timespec_valid(value.it_value_sec, value.it_value_nsec) ||
+    if (!timespec_valid(value.it_value_sec, value.it_value_nsec) ||
         !timespec_valid(value.it_interval_sec, value.it_interval_nsec))
         return -LINUX_EINVAL;
     int ret = signal_posix_timer_set(id, flags, &value, &old);
