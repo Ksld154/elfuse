@@ -733,11 +733,17 @@ run_unit_tests()
     test_check "$runner" "test-cloexec" "PASS" "$bindir/test-cloexec"
     test_rc "$runner" "test-exec-limits" 0 "$bindir/test-exec-limits"
     test_rc "$runner" "test-session" 0 "$bindir/test-session"
-    test_rc "$runner" "test-pidfd" 0 "$bindir/test-pidfd"
+    test_check "$runner" "test-pidfd" "0 failed" "$bindir/test-pidfd"
     test_check "$runner" "test-pidfd-dup" "0 failed" "$bindir/test-pidfd-dup"
     test_check "$runner" "test-pidfd-fork" "0 failed" "$bindir/test-pidfd-fork"
 
     printf "\nSignal tests\n"
+    test_check "$runner" "test-posix-timers" "0 failed" "$bindir/test-posix-timers"
+    if [ "$runner" = "run_elfuse" ]; then
+        # Pins unsupported thread notification and current Linux timer cleanup.
+        test_check "$runner" "test-posix-timers-elfuse" "0 failed" \
+            "$bindir/test-posix-timers" elfuse
+    fi
     test_check "$runner" "test-signal" "PASS|0 failed" "$bindir/test-signal"
     test_check "$runner" "test-signal-thread" "PASS|0 failed" "$bindir/test-signal-thread"
     test_check "$runner" "test-signal-in-shim" "0 failed" \
