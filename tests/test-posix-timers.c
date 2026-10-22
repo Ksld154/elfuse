@@ -112,12 +112,19 @@ static void test_create(void)
     require(timer_settime(timer, 0, &stop, &value) == 0, "disarm timer");
     TEST("settime returns the old interval");
     EXPECT_EQ(value.it_interval.tv_nsec, 100000000, "old interval lost");
+    timer_delete(timer);
+
+    /* Linux 6.12 retains a stale expiry for disarmed SIGEV_NONE timers. */
+    timer = create_timer(SIGUSR1, 0);
+    struct itimerspec armed = {.it_value.tv_sec = 60, .it_interval.tv_sec = 1};
+    require(timer_settime(timer, 0, &armed, NULL) == 0, "arm timer");
+    require(timer_settime(timer, 0, &stop, NULL) == 0, "disarm timer");
     TEST("disarm clears value and interval");
     EXPECT_TRUE(timer_gettime(timer, &value) == 0 &&
                     value.it_value.tv_sec == 0 && value.it_value.tv_nsec == 0 &&
                     value.it_interval.tv_sec == 0 &&
                     value.it_interval.tv_nsec == 0,
-                "disarmed timer retains an interval");
+                "disarmed timer reports a remaining time or an interval");
     timer_delete(timer);
 
     timer = create_timer(SIGUSR1, 71);
