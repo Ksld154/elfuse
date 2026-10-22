@@ -172,6 +172,7 @@ static void test_parent_target(void)
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_usr1;
+    sa.sa_flags = SA_RESTART;
     sigaction(SIGUSR1, &sa, NULL);
 
     int self = pidfd_open(getpid());
